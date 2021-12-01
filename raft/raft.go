@@ -281,8 +281,6 @@ func (r *Raft) tick() {
 		if r.heartbeatElapsed >= r.heartbeatTimeout{
 			// Reset heartbeatElapsed
 			r.resetHeartbeatElapsed()
-			// Reset heartbeatElapsed
-			r.resetHeartbeatElapsed()
 			// Call Step function to handle a message type of MessageType_MsgBeat MessageType.
 			localBeatMsg := r.newMsgBeat()
 			r.Step(localBeatMsg)
@@ -303,7 +301,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	// Reset Vote
 	r.resetVotes()
-	// Reset electionElapsed and hertbeatElapsed
+	// Reset electionElapsed and heartbeatElapsed
 	r.resetElectionElapsed()
 	r.resetHeartbeatElapsed()
 }
@@ -328,6 +326,8 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// TODO: NOTE: Leader should propose a noop entry on its term
+	// Update leader
+	r.Lead = r.id
 	// Reset electionElapsed and heartbeatElapsed
 	r.resetElectionElapsed()
 	r.resetHeartbeatElapsed()
@@ -347,19 +347,8 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgHup:
 			// Become Candidate
 			r.becomeCandidate()
-			// Reset the vote pool
-			r.resetVotes()
-			// Send requestVote RPC to all the nodes in the cluster.
-			for id := range r.Prs{
-				r.sendRequestVote(id)
-			}
-			// Vote for itself
-			r.votes[r.id] = true
-			r.Vote = r.id
-			// If there is only one peer in this cluster, just become leader
-			if r.nPeers() == 1{
-				r.becomeLeader()
-			}
+			// Send request vote to all the nodes in this cluster.
+			r.sendAllRequestVotes()
 		case pb.MessageType_MsgAppend:
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgRequestVote:
@@ -372,18 +361,11 @@ func (r *Raft) Step(m pb.Message) error {
 		switch m.MsgType{
 		case pb.MessageType_MsgHup:
 			// Become Candidate
+			// In becomeCandidate, it will increase the term of this peer, and set or reset some status of Raft,
+			// such as electionElapsed and heartBeatElapsed.
 			r.becomeCandidate()
-			// Send requestVote RPC to all the nodes in the cluster.
-			for id := range r.Prs{
-				r.sendRequestVote(id)
-			}
-			// Vote for itself
-			r.votes[r.id] = true
-			r.Vote = r.id
-			// If there is only one peer in this cluster, just become leader
-			if r.nPeers() == 1{
-				r.becomeLeader()
-			}
+			// Send request vote to all the nodes in this cluster.
+			r.sendAllRequestVotes()
 		case pb.MessageType_MsgAppend:
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgRequestVote:
@@ -606,4 +588,19 @@ func (r *Raft) newMsgBeat() pb.Message{
 
 func (r *Raft) getRandomElectionTick()int{
 	return rand.Intn(10) + 10
+}
+
+func (r *Raft) sendAllRequestVotes(){
+	// Vote for itself
+	r.votes[r.id] = true
+	r.Vote = r.id
+	// If there is only one peer in this cluster, just become leader
+	if r.nPeers() == 1{
+		r.becomeLeader()
+	}else{
+		// Send requestVote RPC to all the nodes in the cluster.
+		for id := range r.Prs{
+			r.sendRequestVote(id)
+		}
+	}
 }
