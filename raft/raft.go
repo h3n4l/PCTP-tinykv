@@ -333,6 +333,10 @@ func (r *Raft) becomeLeader() {
 	r.resetHeartbeatElapsed()
 	// Transfer state to StateLeader
 	r.State = StateLeader
+	// When a node become to candidate, it need send heartbeat to other peers.
+	// Call Step function to handle a message type of MessageType_MsgBeat MessageType.
+	localBeatMsg := r.newMsgBeat()
+	r.Step(localBeatMsg)
 }
 
 // Step the entrance of handle message, see `MessageType`
