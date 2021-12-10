@@ -250,7 +250,7 @@ func (l *RaftLog) tryMatch(i, t uint64) bool {
 	return (l.entries[i-offset].Term) == t
 }
 
-// tryDeleteEnts will delete the entries which index >= i
+// tryDeleteEnts will delete the entries which index > i
 func (l *RaftLog) tryDeleteEnts(i uint64) {
 	if l.entriesLen() == 0 {
 		return
@@ -267,6 +267,19 @@ func (l *RaftLog) tryDeleteEnts(i uint64) {
 	if i < offset || i > l.LastIndex() {
 		log.Panic("Try commit the ents which out of range.")
 	}
-	l.entries = l.entries[0 : i-offset+1]
+	l.entries = l.entries[0 : i-offset + 1]
 
+}
+
+func (l *RaftLog) appliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+	if l.committed < i {
+		log.Panicf("Try to applied to %d, but the commited is also %d", i, l.committed)
+	}
+	if i < l.applied {
+		log.Panicf("Try to applied to %d, buf the had applied is %d", i, l.committed)
+	}
+	l.applied = i
 }
