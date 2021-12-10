@@ -185,12 +185,16 @@ func newRaft(c *Config) *Raft {
 		leadTransferee:   0, // TODO: 3A leader transfer
 		PendingConfIndex: 0, // TODO: 3A conf change
 	}
+	r.RaftLog = newLog(c.Storage)
 	r.msgs = make([]pb.Message, 0)
 	r.votes = make(map[uint64]bool)
 	r.Prs = make(map[uint64]*Progress)
 	for _, id := range c.peers {
 		r.votes[id] = false
-		r.Prs[id] = nil // TODO: (2AB)
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  0,
+		}
 	}
 	// Set random seed
 	rand.Seed(time.Now().Unix())
@@ -201,7 +205,30 @@ func newRaft(c *Config) *Raft {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	if r.Prs[to].Next == r.RaftLog.LastIndex()+1 {
+		return false
+	}
+	m := pb.Message{
+		MsgType:  pb.MessageType_MsgAppend,
+		To:       to,
+		From:     r.id,
+		Term:     r.Term,
+		LogTerm:  0,
+		Index:    r.Prs[to].Next - 1,
+		Entries:  nil,
+		Commit:   r.RaftLog.committed,
+		Snapshot: nil,
+	}
+	// m.LogTerm is prevLogTerm in raft paper
+	lt, _ := r.RaftLog.Term(r.Prs[to].Next - 1)
+	m.LogTerm = lt
+	m.Entries = make([]*pb.Entry, r.RaftLog.LastIndex()+1-r.Prs[to].Next)
+	ents := r.RaftLog.getEnts(r.Prs[to].Next, r.RaftLog.LastIndex()+1)
+	for k := range ents {
+		m.Entries[k] = &ents[k]
+	}
+	r.msgs = append(r.msgs, m)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -210,19 +237,16 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	if to != r.id {
 		// send heart beat
 		heartbeatMessage := pb.Message{
-			MsgType:              pb.MessageType_MsgHeartbeat,
-			To:                   to,
-			From:                 r.id,
-			Term:                 r.Term,
-			LogTerm:              0,   // TODO: modify here in 2AB log replication
-			Index:                0,   // TODO: modify here in 2AB log replication
-			Entries:              nil, // TODO: modify here in 2AB log replication
-			Commit:               0,   // TODO: modify here in 2AB log replication
-			Snapshot:             nil, // TODO: modify here in 2AC snapshot
-			Reject:               false,
-			XXX_NoUnkeyedLiteral: struct{}{},
-			XXX_unrecognized:     nil,
-			XXX_sizecache:        0,
+			MsgType:  pb.MessageType_MsgHeartbeat,
+			To:       to,
+			From:     r.id,
+			Term:     r.Term,
+			LogTerm:  0,   // TODO: modify here in 2AB log replication
+			Index:    0,   // TODO: modify here in 2AB log replication
+			Entries:  nil, // TODO: modify here in 2AB log replication
+			Commit:   r.RaftLog.getCommited(),
+			Snapshot: nil, // TODO: modify here in 2AC snapshot
+			Reject:   false,
 		}
 		r.msgs = append(r.msgs, heartbeatMessage)
 	}
@@ -233,20 +257,21 @@ func (r *Raft) sendRequestVote(to uint64) {
 	if to != r.id {
 		// send heart beat
 		heartbeatMessage := pb.Message{
-			MsgType:              pb.MessageType_MsgRequestVote,
-			To:                   to,
-			From:                 r.id,
-			Term:                 r.Term,
-			LogTerm:              0,   // TODO: modify here in 2AB log replication
-			Index:                0,   // TODO: modify here in 2AB log replication
-			Entries:              nil, // TODO: modify here in 2AB log replication
-			Commit:               0,   // TODO: modify here in 2AB log replication
-			Snapshot:             nil, // TODO: modify here in 2AC snapshot
-			Reject:               false,
-			XXX_NoUnkeyedLiteral: struct{}{},
-			XXX_unrecognized:     nil,
-			XXX_sizecache:        0,
+			MsgType:  pb.MessageType_MsgRequestVote,
+			To:       to,
+			From:     r.id,
+			Term:     r.Term,
+			LogTerm:  0,   // TODO: modify here in 2AB log replication
+			Index:    0,   // TODO: modify here in 2AB log replication
+			Entries:  nil, // TODO: modify here in 2AB log replication
+			Commit:   0,   // TODO: modify here in 2AB log replication
+			Snapshot: nil, // TODO: modify here in 2AC snapshot
+			Reject:   false,
 		}
+		// In the message type of MsgRequestVote, the LogTerm is the last term, the Index is the last index
+		heartbeatMessage.Index = r.RaftLog.LastIndex()
+		term, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
+		heartbeatMessage.LogTerm = term
 		r.msgs = append(r.msgs, heartbeatMessage)
 	}
 }
@@ -333,11 +358,30 @@ func (r *Raft) becomeLeader() {
 	r.resetHeartbeatElapsed()
 	// Transfer state to StateLeader
 	r.State = StateLeader
+	// In raft paper, a peer should send heartbeat when it becomes leader,
+	// but in TestLeaderStartReplication2AB, it will not hope get heartbeat msg.
 	// When a node become to candidate, it need send heartbeat to other peers.
 	// Call Step function to handle a message type of MessageType_MsgBeat MessageType.
-	localBeatMsg := r.newMsgBeat()
-	r.Step(localBeatMsg)
-	// Leader should propose a noop entry on it's term
+	//localBeatMsg := r.newMsgBeat()
+	//r.Step(localBeatMsg)
+	// reset r.Prs
+	// Leader should append a noop entry on it's term
+	for id, _ := range r.Prs {
+		if id == r.id {
+			r.Prs[id].Next = r.RaftLog.LastIndex() + 1
+			r.Prs[id].Match = r.RaftLog.LastIndex()
+
+		}
+		r.Prs[id].Next = r.RaftLog.LastIndex() + 1
+		r.Prs[id].Match = 0
+	}
+	emptyEntry := pb.Entry{
+		EntryType: pb.EntryType_EntryNormal,
+		Data:      nil,
+	}
+	// leader append a noop entry and send propose
+	r.appendEntry(emptyEntry)
+	r.bcastAppend()
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -387,8 +431,20 @@ func (r *Raft) Step(m pb.Message) error {
 			for id := range r.Prs {
 				r.sendHeartbeat(id)
 			}
+		case pb.MessageType_MsgPropose:
+			for _, ent := range m.Entries {
+				r.appendEntry(*ent)
+			}
+			if r.nPeers() == 1 {
+				// commit
+				r.RaftLog.committed = r.RaftLog.LastIndex()
+			} else {
+				r.bcastAppend()
+			}
 		case pb.MessageType_MsgAppend:
 			r.handleAppendEntries(m)
+		case pb.MessageType_MsgAppendResponse:
+			r.handleAppendResponse(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handleRequestVote(m)
 		case pb.MessageType_MsgHeartbeat:
@@ -408,25 +464,63 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// This raft peer is overdue, become follower
 		r.becomeFollower(m.Term, m.From)
 	}
-
+	appendResp := pb.Message{
+		MsgType:  pb.MessageType_MsgAppendResponse,
+		To:       m.From,
+		From:     r.id,
+		Term:     r.Term,
+		LogTerm:  0,
+		Index:    0,
+		Entries:  nil,
+		Commit:   0,
+		Snapshot: nil,
+		Reject:   false,
+	}
+	defer func() {
+		r.msgs = append(r.msgs, appendResp)
+	}()
+	if m.Term < r.Term {
+		appendResp.Reject = true
+		return
+	}
+	// try match
+	if match := r.RaftLog.tryMatch(m.Index, m.LogTerm); !match {
+		appendResp.Reject = true
+		return
+	}
+	for len(m.Entries) != 0 {
+		if match := r.RaftLog.tryMatch(m.Entries[0].Index, m.Entries[0].Term); !match {
+			r.RaftLog.tryDeleteEnts(m.Entries[0].Index - 1)
+			break
+		} else {
+			// if match, don't need append it
+			m.Entries = m.Entries[1:]
+		}
+	}
+	// append it
+	for _, ent := range m.Entries {
+		r.appendEntry(*ent)
+	}
+	// update commit
+	r.RaftLog.committed = min(r.RaftLog.LastIndex(), m.Commit)
+	appendResp.Commit = r.RaftLog.getCommited()
+	appendResp.Index = r.RaftLog.LastIndex()
+	return
 }
 
 // handleRequestVote handle RequestVote RPC request
 func (r *Raft) handleRequestVote(m pb.Message) {
 	resp := pb.Message{
-		MsgType:              pb.MessageType_MsgRequestVoteResponse,
-		To:                   m.From,
-		From:                 r.id,
-		Term:                 r.Term, // set later
-		LogTerm:              0,      // TODO: modify here in 2AB log replication
-		Index:                0,      // TODO: modify here in 2AB log replication
-		Entries:              nil,    // TODO: modify here in 2AB log replication
-		Commit:               0,      // TODO: modify here in 2AB log replication
-		Snapshot:             nil,    // TODO: modify here in 2AC snapshot
-		Reject:               true,   // set later
-		XXX_NoUnkeyedLiteral: struct{}{},
-		XXX_unrecognized:     nil,
-		XXX_sizecache:        0,
+		MsgType:  pb.MessageType_MsgRequestVoteResponse,
+		To:       m.From,
+		From:     r.id,
+		Term:     r.Term, // set later
+		LogTerm:  0,      // TODO: modify here in 2AB log replication
+		Index:    0,      // TODO: modify here in 2AB log replication
+		Entries:  nil,    // TODO: modify here in 2AB log replication
+		Commit:   0,      // TODO: modify here in 2AB log replication
+		Snapshot: nil,    // TODO: modify here in 2AC snapshot
+		Reject:   true,   // set later
 	}
 	if m.Term < r.Term {
 		resp.Reject = true
@@ -443,14 +537,32 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	// Check the VoteFor
 	if r.Vote == 0 || r.Vote == m.From {
 		// TODO: check the log (2AB)
-		if true {
+		lt, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
+		// compare the last term
+		if lt < m.LogTerm {
 			// Vote
 			r.Vote = m.From
 			resp.Reject = false
+		} else if lt == m.LogTerm {
+			if r.RaftLog.LastIndex() <= m.Index {
+				// Vote
+				r.Vote = m.From
+				resp.Reject = false
+			}
 		}
 	}
 	r.msgs = append(r.msgs, resp)
 	return
+}
+
+// bcastAppend send a message type of append to append the ents to other peers
+func (r *Raft) bcastAppend() {
+	for id, _ := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		r.sendAppend(id)
+	}
 }
 
 // handleRequestVoteResponse handle RequestVote RPC response
@@ -480,21 +592,20 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 		return
 	}
+
 	resp := pb.Message{
-		MsgType:              pb.MessageType_MsgHeartbeatResponse,
-		To:                   m.From,
-		From:                 r.id,
-		Term:                 r.Term,
-		LogTerm:              0,   // TODO: modify here in 2AB log replication
-		Index:                0,   // TODO: modify here in 2AB log replication
-		Entries:              nil, // TODO: modify here in 2AB log replication
-		Commit:               0,   // TODO: modify here in 2AB log replication
-		Snapshot:             nil, // TODO: modify here in 2AC snapshot
-		Reject:               false,
-		XXX_NoUnkeyedLiteral: struct{}{},
-		XXX_unrecognized:     nil,
-		XXX_sizecache:        0,
+		MsgType:  pb.MessageType_MsgHeartbeatResponse,
+		To:       m.From,
+		From:     r.id,
+		Term:     r.Term,
+		LogTerm:  0,   // TODO: modify here in 2AB log replication
+		Index:    0,   // TODO: modify here in 2AB log replication
+		Entries:  nil, // TODO: modify here in 2AB log replication
+		Commit:   0,   // TODO: modify here in 2AB log replication
+		Snapshot: nil, // TODO: modify here in 2AC snapshot
+		Reject:   false,
 	}
+	r.RaftLog.committed = min(r.RaftLog.LastIndex(), m.Commit)
 	r.msgs = append(r.msgs, resp)
 	// reset electionElapsed
 	r.resetElectionElapsed()
@@ -505,6 +616,46 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	if m.Term > r.Term {
 		r.becomeFollower(m.Term, m.From)
 		return
+	}
+}
+
+func (r *Raft) handleAppendResponse(m pb.Message) {
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, m.From)
+		return
+	}
+	// check the reject
+	if m.Reject {
+		r.Prs[m.From].Next -= 1
+		// if reject, need send again with new next
+		r.sendAppend(m.From)
+		return
+	}
+	r.Prs[m.From].Next = m.Index + 1
+	r.Prs[m.From].Match = r.Prs[m.From].Next - 1
+	// Attention: A leader only log entries from the leader’s current term are committed by counting replicas.
+	// TODO: optimize: compare the commit of `r` and the Match, can skip the
+	// nCopied (O(n)) in some situations.
+	lt, _ := r.RaftLog.Term(r.Prs[m.From].Next - 1)
+	if r.Term == lt {
+		if r.nCopied(r.Prs[m.From].Match) >= r.nPeers()/2+1 && r.RaftLog.getCommited() <= r.Prs[m.From].Match {
+			r.RaftLog.tryCommit(r.Prs[m.From].Match)
+		}
+		// Try telling follower to commit
+		if m.Commit < r.RaftLog.getCommited() {
+			cm := pb.Message{
+				MsgType: pb.MessageType_MsgAppend,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				LogTerm: 0,
+				Index:   r.Prs[m.From].Next - 1,
+				Entries: nil,
+				Commit:  r.RaftLog.getCommited(),
+			}
+			cm.LogTerm = lt
+			r.msgs = append(r.msgs, cm)
+		}
 	}
 }
 
@@ -557,37 +708,31 @@ func (r *Raft) resetVotes() {
 
 func (r *Raft) newMsgHup() pb.Message {
 	return pb.Message{
-		MsgType:              pb.MessageType_MsgHup,
-		To:                   r.id,
-		From:                 r.id,
-		Term:                 r.Term,
-		LogTerm:              0,   // TODO: modify here in 2AB log replication
-		Index:                0,   // TODO: modify here in 2AB log replication
-		Entries:              nil, // TODO: modify here in 2AB log replication
-		Commit:               0,   // TODO: modify here in 2AB log replication
-		Snapshot:             nil, // TODO: modify here in 2AC snapshot
-		Reject:               false,
-		XXX_NoUnkeyedLiteral: struct{}{},
-		XXX_unrecognized:     nil,
-		XXX_sizecache:        0,
+		MsgType:  pb.MessageType_MsgHup,
+		To:       r.id,
+		From:     r.id,
+		Term:     r.Term,
+		LogTerm:  0,   // TODO: modify here in 2AB log replication
+		Index:    0,   // TODO: modify here in 2AB log replication
+		Entries:  nil, // TODO: modify here in 2AB log replication
+		Commit:   0,   // TODO: modify here in 2AB log replication
+		Snapshot: nil, // TODO: modify here in 2AC snapshot
+		Reject:   false,
 	}
 }
 
 func (r *Raft) newMsgBeat() pb.Message {
 	return pb.Message{
-		MsgType:              pb.MessageType_MsgBeat,
-		To:                   r.id,
-		From:                 r.id,
-		Term:                 r.Term,
-		LogTerm:              0,   // TODO: modify here in 2AB log replication
-		Index:                0,   // TODO: modify here in 2AB log replication
-		Entries:              nil, // TODO: modify here in 2AB log replication
-		Commit:               0,   // TODO: modify here in 2AB log replication
-		Snapshot:             nil, // TODO: modify here in 2AC snapshot
-		Reject:               false,
-		XXX_NoUnkeyedLiteral: struct{}{},
-		XXX_unrecognized:     nil,
-		XXX_sizecache:        0,
+		MsgType:  pb.MessageType_MsgBeat,
+		To:       r.id,
+		From:     r.id,
+		Term:     r.Term,
+		LogTerm:  0,   // TODO: modify here in 2AB log replication
+		Index:    0,   // TODO: modify here in 2AB log replication
+		Entries:  nil, // TODO: modify here in 2AB log replication
+		Commit:   0,   // TODO: modify here in 2AB log replication
+		Snapshot: nil, // TODO: modify here in 2AC snapshot
+		Reject:   false,
 	}
 }
 
@@ -608,4 +753,38 @@ func (r *Raft) sendAllRequestVotes() {
 			r.sendRequestVote(id)
 		}
 	}
+}
+
+func (r *Raft) appendEntry(ents ...pb.Entry) {
+	li := r.RaftLog.LastIndex()
+	switch r.State {
+	case StateLeader:
+		// If the state is leader, need set the index and the term
+		for k, _ := range ents {
+			ents[k].Index = li + uint64(k) + 1
+			ents[k].Term = r.Term
+		}
+		r.RaftLog.append(ents...)
+		// Update the match and the next
+		r.Prs[r.id].Next += uint64(len(ents))
+		r.Prs[r.id].Match += uint64(len(ents))
+	case StateCandidate:
+		r.RaftLog.append(ents...)
+	case StateFollower:
+		r.RaftLog.append(ents...)
+	}
+}
+
+func (r *Raft) nCopied(i uint64) uint64 {
+	// n will be init as 1, because it will at least occurs in r
+	var n uint64 = 1
+	for id, p := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		if p.Match >= i {
+			n += 1
+		}
+	}
+	return n
 }
