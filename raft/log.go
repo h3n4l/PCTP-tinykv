@@ -135,14 +135,17 @@ func (l *RaftLog) maybeCompact() {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	if l.isEntriesEmpty() {
+		// There is no entry in the raftLog
 		return []pb.Entry{}
 	}
 	if l.stabled == l.LastIndex() {
+		// There is no unstable entry in the raftLog
 		return []pb.Entry{}
 	}
+	// Get the offset of the entry
 	offset := l.entries[0].Index
 	ents := make([]pb.Entry, l.LastIndex()-l.stabled)
-	for k, ent := range l.entries[l.stabled-offset+1 : l.LastIndex()-offset+1] {
+	for k, ent := range l.entries[l.stabled-offset+1:] {
 		ents[k] = ent
 	}
 	return ents
@@ -151,10 +154,12 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	if l.entriesLen() == 0 {
+	if l.isEntriesEmpty() {
+		// There is no entry in the raftLog
 		return []pb.Entry{}
 	}
 	if l.committed == l.applied {
+		// There is no had committed but not applied entry in the raftLog
 		return []pb.Entry{}
 	}
 	offset := l.entries[0].Index
@@ -169,33 +174,46 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if l.isEntriesEmpty() {
-		return 0
+		return l.stabled
 	}
+	// l.entries[len(l.entries)-1].Index will always greater or equal than the l.stabled.
 	return l.entries[len(l.entries)-1].Index
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if i > l.LastIndex() || i == 0 {
+	// We don't hope try to get the term of index 0.
+	// There will an situation that will call Term(0):
+	// 1. A raft cluster is be init as start status(no snapshot and no storage)
+	// a node win the first election, and append a noop entry, set the Prs[otherNodeId].Next = 1,
+	// and it will send append msg and set the prevTerm by calling Term(Prs[to].Next-1) = Term(0)
+	if i == 0 {
+		return 0, nil
+	}
+	// There will be three situations that will cause the log entries to be empty:
+	// 1. A raft system is just init as start status(no snapshot and no storage)
+	// and all nodes are at term 0(None leader election happened).
+	// 2. A raft system is at term 1, but follower had not received log(even the noop entry).
+	// 3. All stabled entries are compacted.
+	if l.isEntriesEmpty() {
 		return 0, EntriesUnavailable
 	}
 	offset := l.entries[0].Index
+	if i > l.LastIndex() || i < offset {
+		// If the index is greater than the LastIndex or try to get a term which had been compacted,
+		// it will return an error
+		return 0, EntriesUnavailable
+	}
 	return l.entries[i-offset].Term, nil
 }
 
-// Index return the Index of the entry in the given Position
-func (l *RaftLog) Index(p uint64) uint64 {
-	if p >= uint64(len(l.entries)) {
-		log.Panic("Position out of range.")
-	}
-	return l.entries[p].Index
-}
-
+// isEntriesEmpty return true if the len(l.entries) == 0
 func (l *RaftLog) isEntriesEmpty() bool {
 	return len(l.entries) == 0
 }
 
+// append will append the ents into the entries
 func (l *RaftLog) append(ents ...pb.Entry) {
 	if len(ents) == 0 {
 		return
@@ -203,18 +221,15 @@ func (l *RaftLog) append(ents ...pb.Entry) {
 	l.entries = append(l.entries, ents...)
 }
 
-func (l *RaftLog) entriesLen() uint64 {
-	return uint64(len(l.entries))
-}
-
 // getEnts returns the index of entries in range [lo, hi)
 func (l *RaftLog) getEnts(lo uint64, hi uint64) []pb.Entry {
-	if l.entriesLen() == 0 {
+	if l.isEntriesEmpty() {
 		panic("Entries of RaftLog is empty.")
 	}
 	offset := l.entries[0].Index
+	// May be a erroneous request or try to get a entry which had been compacted.
 	if lo < offset || hi > l.LastIndex()+1 {
-		panic("Try get ents out of range.")
+		log.Panicf("Try get ents [%d:%d] out of range [%d:%d].", lo, hi, offset, l.LastIndex())
 	}
 	ents := make([]pb.Entry, hi-lo)
 	for k, ent := range l.entries[lo-offset : hi-offset] {
@@ -223,33 +238,33 @@ func (l *RaftLog) getEnts(lo uint64, hi uint64) []pb.Entry {
 	return ents
 }
 
+// Try commit will try to commit the log entries whose index <= i
+// It will do nothing if i <= committed, and commit to the min(l.LastIndex(), i)
+//
 func (l *RaftLog) tryCommit(i uint64) bool {
-	if l.entriesLen() == 0 {
-		log.Panic("Entries of RaftLog is empty.")
+	if i <= l.committed {
+		return false
 	}
-	offset := l.entries[0].Index
-	if i < offset || i > l.LastIndex() {
-		log.Panic("Try commit the ents which out of range.")
-	}
-	if i >= l.committed {
-		l.committed = i
-		return true
-	}
-	return false
+	l.committed = min(i, l.LastIndex())
+	return true
 }
 
 func (l *RaftLog) getCommited() uint64 {
 	return l.committed
 }
 
+// tryMatch try to find a log which index is i and term is t
 func (l *RaftLog) tryMatch(i, t uint64) bool {
+	// tryMatch(0) will always return true.
 	if i == 0 {
 		return true
-		//if l.entriesLen() == 0 {
-		//	return true
-		//}
-		//return false
 	}
+	// Try to match a log which had been compacted.
+	if l.isEntriesEmpty() && i <= l.stabled {
+		// TODO: return false instead?
+		log.Panicf("Try to match (i,t) = (%d,%d) in the raftLog which stabled = %d and entries is empty.", i, t, l.stabled)
+	}
+	// Try to match a log that has not been received
 	if i > l.LastIndex() {
 		return false
 	}
@@ -257,25 +272,24 @@ func (l *RaftLog) tryMatch(i, t uint64) bool {
 	return (l.entries[i-offset].Term) == t
 }
 
-// tryDeleteEnts will delete the entries which index > i
+// tryDeleteEnts will try to delete the entries which index > i
 func (l *RaftLog) tryDeleteEnts(i uint64) {
-	if l.entriesLen() == 0 {
+	// No entries can be delete.
+	if l.isEntriesEmpty() {
 		return
 	}
+	if i >= l.LastIndex() {
+		return
+	}
+	// Before return, need update the stable
 	defer func() {
-		// update the stable
 		l.stabled = min(l.stabled, i)
 	}()
-	if i == 0 {
-		l.entries = make([]pb.Entry, 0)
-		return
-	}
+	i = max(l.hadCompacted(), i)
+	// delete the entries which are not been compacted and greater than i
 	offset := l.entries[0].Index
-	if i < offset || i > l.LastIndex() {
-		log.Panic("Try commit the ents which out of range.")
-	}
-	l.entries = l.entries[0 : i-offset+1]
-
+	// `i` may less than offset, and it's a uint64, add brackets to avoid underflow
+	l.entries = l.entries[0 : (i+1)-offset]
 }
 
 func (l *RaftLog) appliedTo(i uint64) {
@@ -289,4 +303,13 @@ func (l *RaftLog) appliedTo(i uint64) {
 		log.Panicf("Try to applied to %d, buf the had applied is %d", i, l.committed)
 	}
 	l.applied = i
+}
+
+// hadCompacted will return the highest position of log which is compacted.
+func (l *RaftLog) hadCompacted() uint64 {
+	snapshot, ssErr := l.storage.Snapshot()
+	if ssErr != nil {
+		panic(ssErr)
+	}
+	return snapshot.Metadata.Index
 }
