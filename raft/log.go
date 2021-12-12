@@ -61,9 +61,9 @@ type RaftLog struct {
 }
 
 // If a peer was start with begin status, the entries will like this:
-// Index of RaftLog.Entries:		  | 0		1		2		...		n	|
-// 								      +-------------------------------------+
-// Index of Entry in RaftLog.Entries: | 1	    2		3		...		n+1	|
+// Index of RaftLog.Entries:		  		| 0		1		2		...		n	|
+// 								      		+-------------------------------------+
+// Index of Entry in RaftLog.Entries: 	| 1	    2		3		...		n+1	|
 // If a peer was restart with a conf, the entries will like this : (offset = entries[0].Index)
 // Index of RaftLog.Entries:		  | 0				1		...			n		|
 // 								      +---------------------------------------------+
@@ -72,8 +72,10 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
+	// The application need protect that the storage can not be nil.
+	// To new a storage by using: ms := NewMemoryStorage()
 	if storage == nil {
-		log.Panic("Storage cannot be nil.")
+		panic("Storage cannot be nil.")
 	}
 	rl := &RaftLog{
 		storage:         storage,
@@ -83,37 +85,42 @@ func newLog(storage Storage) *RaftLog {
 		entries:         nil,
 		pendingSnapshot: nil, // TODO: how to set
 	}
-	fi, fierr := storage.FirstIndex()
-	// Check the error of storage.FirstIndex, but in that function,
-	// always return nil error.
-	if fierr != nil {
-		log.Panic("storage.FirstIndex returns a error.")
+	// Read the commit index from HardState and set the commit of `rl`.
+	// err will always be nil, refer: MemoryStorage.InitialState
+	// TODO: storage.InitialState will return a confState, modify here if you want to handle it.
+	hs, _, isErr := storage.InitialState()
+	if isErr != nil {
+		panic(isErr)
 	}
-	li, lierr := storage.LastIndex()
-	// Check the error of storage.LastIndex, but in that function,
-	// always return nil error.
-	if lierr != nil {
-		log.Panic("storage.LastIndex returns a error.")
+	rl.committed = hs.Commit
+	// Read the applied index from snapshot in storage
+	// sErr is always be nil in the MemoryStorage.
+	snapshot, sErr := storage.Snapshot()
+	if sErr != nil {
+		panic(sErr)
 	}
-	// If the fi == li + 1, means the storage only contains dummy entries
-	// this RaftLog just be init with start status.
+	rl.applied = snapshot.Metadata.Index
+	// Get the firstIndex and lastIndex from storage.
+	// TODO: check here if you modify the log logic.
+	fi, fiErr := storage.FirstIndex()
+	if fiErr != nil {
+		panic(fiErr)
+	}
+	li, liErr := storage.LastIndex()
+	if liErr != nil {
+		panic(liErr)
+	}
 	if fi == li+1 {
-		rl.committed = 0
-		rl.applied = 0
-		rl.stabled = 0
+		// The storage only contain a dummy entry or an entry which records the compact index.
 		rl.entries = make([]pb.Entry, 0)
-		return rl
+	} else {
+		// TODO: Modify the _ when you want to handle the Error
+		ents, _ := storage.Entries(fi, li+1)
+		// TODO: Instead of copy?
+		rl.entries = ents
 	}
-	// TODO: check Supposed that the entry in snapshot are applied and commited.
-	// The storage have some information, init this RaftLog with the fields in storage
-	rl.committed = fi - 1
-	rl.applied = fi - 1
+	// set the stabled
 	rl.stabled = li
-	ents, entserr := storage.Entries(fi, li+1)
-	if entserr != nil {
-		log.Panic(entserr)
-	}
-	rl.entries = ents
 	return rl
 }
 
@@ -267,7 +274,7 @@ func (l *RaftLog) tryDeleteEnts(i uint64) {
 	if i < offset || i > l.LastIndex() {
 		log.Panic("Try commit the ents which out of range.")
 	}
-	l.entries = l.entries[0 : i-offset + 1]
+	l.entries = l.entries[0 : i-offset+1]
 
 }
 
