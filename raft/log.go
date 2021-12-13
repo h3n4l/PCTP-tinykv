@@ -141,3 +141,11 @@ func (l *RaftLog) append(ents ...pb.Entry) {
 	}
 	l.entries = append(l.entries, ents...)
 }
+
+func (l *RaftLog) tryCommit(i uint64) bool {
+	if i <= l.committed {
+		return false
+	}
+	l.committed = min(i, l.LastIndex())
+	return true
+}
