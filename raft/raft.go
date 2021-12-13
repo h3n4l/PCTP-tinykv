@@ -222,6 +222,11 @@ func newRaft(c *Config) *Raft {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
+	// There are several situations where you don't need to send rpc:
+	// 1. The log of `to` is as new as leader.
+	if to == r.id {
+		return false
+	}
 	if r.Prs[to].Next == r.RaftLog.LastIndex()+1 {
 		return false
 	}
@@ -237,6 +242,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Snapshot: nil,
 	}
 	// m.LogTerm is prevLogTerm in raft paper
+	// TODO: Modify here if you want to handle the error.
 	lt, _ := r.RaftLog.Term(r.Prs[to].Next - 1)
 	m.LogTerm = lt
 	m.Entries = make([]*pb.Entry, r.RaftLog.LastIndex()+1-r.Prs[to].Next)
@@ -251,46 +257,49 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	if to != r.id {
-		// send heart beat
-		heartbeatMessage := pb.Message{
-			MsgType:  pb.MessageType_MsgHeartbeat,
-			To:       to,
-			From:     r.id,
-			Term:     r.Term,
-			LogTerm:  0,   // TODO: modify here in 2AB log replication
-			Index:    0,   // TODO: modify here in 2AB log replication
-			Entries:  nil, // TODO: modify here in 2AB log replication
-			Commit:   r.RaftLog.getCommited(),
-			Snapshot: nil, // TODO: modify here in 2AC snapshot
-			Reject:   false,
-		}
-		r.msgs = append(r.msgs, heartbeatMessage)
+	if to == r.id {
+		return
 	}
+	// send heart beat
+	heartbeatMessage := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		// A peer will not handle the prevTerm and prevIndex in HeartBeatMsg.
+		LogTerm:  0,
+		Index:    0,
+		Entries:  nil,
+		Commit:   r.RaftLog.getCommited(),
+		Snapshot: nil, // TODO: modify here in 2AC snapshot
+		Reject:   false,
+	}
+	r.msgs = append(r.msgs, heartbeatMessage)
 }
 
 // sendRequestVote sends a requestVote RPC to the given peer.
 func (r *Raft) sendRequestVote(to uint64) {
-	if to != r.id {
-		// send heart beat
-		heartbeatMessage := pb.Message{
-			MsgType:  pb.MessageType_MsgRequestVote,
-			To:       to,
-			From:     r.id,
-			Term:     r.Term,
-			LogTerm:  0,   // TODO: modify here in 2AB log replication
-			Index:    0,   // TODO: modify here in 2AB log replication
-			Entries:  nil, // TODO: modify here in 2AB log replication
-			Commit:   0,   // TODO: modify here in 2AB log replication
-			Snapshot: nil, // TODO: modify here in 2AC snapshot
-			Reject:   false,
-		}
-		// In the message type of MsgRequestVote, the LogTerm is the last term, the Index is the last index
-		heartbeatMessage.Index = r.RaftLog.LastIndex()
-		term, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
-		heartbeatMessage.LogTerm = term
-		r.msgs = append(r.msgs, heartbeatMessage)
+	if to == r.id {
+		return
 	}
+	reqVoteMessage := pb.Message{
+		MsgType: pb.MessageType_MsgRequestVote,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		LogTerm: 0,
+		Index:   0,
+		// Vote msg will not carry the entries.
+		Entries:  nil,
+		Commit:   0,
+		Snapshot: nil, // TODO: modify here in 2AC snapshot
+		Reject:   false,
+	}
+	// In the message type of MsgRequestVote, the LogTerm is the last term, the Index is the last index
+	reqVoteMessage.Index = r.RaftLog.LastIndex()
+	term, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
+	reqVoteMessage.LogTerm = term
+	r.msgs = append(r.msgs, reqVoteMessage)
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -382,7 +391,6 @@ func (r *Raft) becomeLeader() {
 	//localBeatMsg := r.newMsgBeat()
 	//r.Step(localBeatMsg)
 	// reset r.Prs
-	// Leader should append a noop entry on it's term
 	for id, _ := range r.Prs {
 		if id == r.id {
 			r.Prs[id].Next = r.RaftLog.LastIndex() + 1
@@ -392,6 +400,7 @@ func (r *Raft) becomeLeader() {
 			r.Prs[id].Match = 0
 		}
 	}
+	// Leader should append a noop entry on it's term
 	emptyEntry := pb.Entry{
 		EntryType: pb.EntryType_EntryNormal,
 		Data:      nil,
@@ -414,7 +423,7 @@ func (r *Raft) Step(m pb.Message) error {
 			// Become Candidate
 			r.becomeCandidate()
 			// Send request vote to all the nodes in this cluster.
-			r.sendAllRequestVotes()
+			r.bcastRequestVote()
 		case pb.MessageType_MsgAppend:
 			r.Lead = m.From
 			r.handleAppendEntries(m)
@@ -433,7 +442,7 @@ func (r *Raft) Step(m pb.Message) error {
 			// such as electionElapsed and heartBeatElapsed.
 			r.becomeCandidate()
 			// Send request vote to all the nodes in this cluster.
-			r.sendAllRequestVotes()
+			r.bcastRequestVote()
 		case pb.MessageType_MsgAppend:
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgRequestVote:
@@ -502,36 +511,41 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		appendResp.Reject = true
 		return
 	}
-	// try match
+	// Try to match the prevIndex and prevTerm
 	if match := r.RaftLog.tryMatch(m.Index, m.LogTerm); !match {
 		appendResp.Reject = true
 		return
 	}
-	ents := make([]*pb.Entry, len(m.Entries))
-	copy(ents, m.Entries)
-	for len(ents) != 0 {
-		if match := r.RaftLog.tryMatch(ents[0].Index, ents[0].Term); !match {
-			r.RaftLog.tryDeleteEnts(ents[0].Index - 1)
+	// append the entry in my log
+	lastNewEntryIndex := m.Index
+	for len(m.Entries) != 0 {
+		entp := m.Entries[0]
+		if match := r.RaftLog.tryMatch(entp.Index, entp.Term); !match {
+			// If it doesn't match, delete it and all logs after it
+			r.RaftLog.tryDeleteEnts(entp.Index - 1)
 			break
 		} else {
-			// if match, don't need append it
-			ents = ents[1:]
+			lastNewEntryIndex = entp.Index
+			m.Entries = m.Entries[1:]
 		}
 	}
-	// append it
-	for _, ent := range ents {
-		r.appendEntry(*ent)
+	for _, entp := range m.Entries {
+		lastNewEntryIndex = entp.Index
+		r.appendEntry(*entp)
 	}
-	// update commit
-	// 3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
-	// TODO: check here and refer to TestHandleMessageType_MsgAppend2AB 's case 7
-	// try to maintain an variable newest?
+	// update the commit index
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// Why need compare the leaderCommit and the commitIndex ? Suppose a scenario:
+	// Three nodes in the raft cluster, and they have the same log, and node 1 is leader.
+	// The commit is 6, 6, 5 in the node 1, 2, 3, because the network of node 3 is congested
+	// and the msg carrying the commit index 6 had loss.
+	// Node 1 collapses before it send the newest commit 6 to the node3.
+	// Node3 starts an election and win it(because node3 and node2 have the same log), and send a append msg with
+	// commit = 5. We don't hope node 2 decrease the commit index.
+
+	// Or you can only using r.RaftLog.tryCommit, because tryCommit will do nothing if the index <= i
 	if m.Commit > r.RaftLog.getCommited() {
-		if len(m.Entries) == 0 {
-			r.RaftLog.committed = min(m.Index, m.Commit)
-		} else {
-			r.RaftLog.committed = min(r.RaftLog.LastIndex(), m.Commit)
-		}
+		r.RaftLog.tryCommit(min(lastNewEntryIndex, m.Commit))
 	}
 	appendResp.Commit = r.RaftLog.getCommited()
 	appendResp.Index = r.RaftLog.LastIndex()
@@ -566,7 +580,6 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	}
 	// Check the VoteFor
 	if r.Vote == 0 || r.Vote == m.From {
-		// TODO: check the log (2AB)
 		lt, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
 		// compare the last term
 		if lt < m.LogTerm {
@@ -631,20 +644,19 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 		return
 	}
-
 	resp := pb.Message{
 		MsgType:  pb.MessageType_MsgHeartbeatResponse,
 		To:       m.From,
 		From:     r.id,
 		Term:     r.Term,
-		LogTerm:  0,   // TODO: modify here in 2AB log replication
-		Index:    0,   // TODO: modify here in 2AB log replication
-		Entries:  nil, // TODO: modify here in 2AB log replication
-		Commit:   0,   // TODO: modify here in 2AB log replication
-		Snapshot: nil, // TODO: modify here in 2AC snapshot
+		LogTerm:  0,
+		Index:    0,
+		Entries:  nil,
+		Commit:   0,
+		Snapshot: nil,
 		Reject:   false,
 	}
-	r.RaftLog.committed = min(r.RaftLog.LastIndex(), m.Commit)
+	r.RaftLog.tryCommit(m.Commit)
 	resp.Commit = r.RaftLog.getCommited()
 	resp.Index = r.RaftLog.LastIndex()
 	r.msgs = append(r.msgs, resp)
@@ -680,16 +692,13 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		return
 	}
 	r.Prs[m.From].Next = m.Index + 1
-	r.Prs[m.From].Match = r.Prs[m.From].Next - 1
-	// Attention: A leader only log entries from the leader’s current term are committed by counting replicas.
-	// TODO: optimize: compare the commit of `r` and the Match, can skip the
-	// nCopied (O(n)) in some situations.
+	r.Prs[m.From].Match = m.Index
 	lt, _ := r.RaftLog.Term(r.Prs[m.From].Next - 1)
+	// The leader only commits the logs for the current term by calculating copies
 	if r.Term == lt {
 		if r.nCopied(r.Prs[m.From].Match) >= r.nPeers()/2+1 && r.RaftLog.getCommited() < r.Prs[m.From].Match {
 			updateCommit := r.RaftLog.tryCommit(r.Prs[m.From].Match)
-			// Tell all followers the newest commit index, it will only send once per peer,
-			// But it is safe
+			// Tell all followers the newest commit index, it will only send once per peer, but it is safe
 			if updateCommit {
 				for id := range r.Prs {
 					if id == r.id {
@@ -807,7 +816,7 @@ func (r *Raft) getRandomElectionTick() int {
 	return rand.Intn(10) + 10
 }
 
-func (r *Raft) sendAllRequestVotes() {
+func (r *Raft) bcastRequestVote() {
 	// Vote for itself
 	r.votes[r.id] = true
 	r.hadVotes[r.id] = true
