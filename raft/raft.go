@@ -156,6 +156,8 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	hadVotes map[uint64]bool
 }
 
 // newRaft return a raft peer with the given config
@@ -164,6 +166,11 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
+
+	hs, _, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
 	r := &Raft{
 		id:               c.ID,
 		Term:             0,
@@ -181,11 +188,21 @@ func newRaft(c *Config) *Raft {
 		leadTransferee:   0,
 		PendingConfIndex: 0,
 	}
+	r.RaftLog = newLog(c.Storage)
+	r.msgs = make([]pb.Message, 0)
 	r.Prs = make(map[uint64]*Progress)
 	r.votes = make(map[uint64]bool)
+	r.hadVotes = make(map[uint64]bool)
 	for _, id := range c.peers {
 		r.votes[id] = false
-		r.Prs[id] = nil
+		r.hadVotes[id] = false
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  0,
+		}
+	}
+	if !IsEmptyHardState(hs) {
+		r.loadState(hs)
 	}
 	return r
 }
@@ -442,4 +459,14 @@ func (r *Raft) newTimeOutMSg() (m pb.Message) {
 		From:    r.id,
 	}
 	return msg
+}
+
+func (r *Raft) loadState(hs pb.HardState) {
+	if hs.Commit < r.RaftLog.getCommitted() || hs.Commit > r.RaftLog.LastIndex() {
+		panic("In `Raft.loadState`: the commit of hardState out of range.")
+	}
+	//当进行newLog的时候已经赋值了一遍？？
+	r.RaftLog.committed = hs.Commit
+	r.Term = hs.Term
+	r.Vote = hs.Vote
 }

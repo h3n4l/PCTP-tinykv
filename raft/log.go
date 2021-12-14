@@ -61,7 +61,45 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	if storage == nil {
+		panic("storage cannot be nil")
+	}
+	rl := &RaftLog{
+		storage:         storage,
+		committed:       0,
+		applied:         0,
+		stabled:         0,
+		entries:         nil,
+		pendingSnapshot: nil,
+	}
+
+	hs, _, isErr := storage.InitialState()
+	if isErr != nil {
+		panic(isErr)
+	}
+	rl.committed = hs.Commit
+
+	snapshot, sErr := storage.Snapshot()
+	if sErr != nil {
+		panic(sErr)
+	}
+	rl.applied = snapshot.Metadata.Index
+	fi, fiErr := storage.FirstIndex()
+	if fiErr != nil {
+		panic(fiErr)
+	}
+	li, liErr := storage.LastIndex()
+	if liErr != nil {
+		panic(liErr)
+	}
+	if fi == li+1 {
+		rl.entries = make([]pb.Entry, 0)
+	} else {
+		ents, _ := storage.Entries(fi, li+1)
+		rl.entries = ents
+	}
+	rl.stabled = li
+	return rl
 }
 
 // We need to compact the log entries in some point of time like
@@ -148,4 +186,8 @@ func (l *RaftLog) tryCommit(i uint64) bool {
 	}
 	l.committed = min(i, l.LastIndex())
 	return true
+}
+
+func (l *RaftLog) getCommitted() uint64 {
+	return l.committed
 }
