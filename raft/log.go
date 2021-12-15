@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -189,5 +190,75 @@ func (l *RaftLog) tryCommit(i uint64) bool {
 }
 
 func (l *RaftLog) getCommitted() uint64 {
+	return l.committed
+}
+
+func (l *RaftLog) appliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+	if l.committed < i {
+		log.Panicf("Try to applied to %d, but the commited is also %d", i, l.committed)
+	}
+	if i < l.applied {
+		log.Panicf("Try to applied to %d, buf the had applied is %d", i, l.committed)
+	}
+	l.applied = i
+}
+
+func (l *RaftLog) getEns(lo uint64, hi uint64) []pb.Entry {
+	if l.isEntriesEmpty() {
+		panic("entries of RaftLog is empty")
+	}
+	offset := l.entries[0].Index
+	if lo < offset || hi > l.LastIndex()+1 {
+		log.Panicf("Try get ents [%d:%d] out of range [%d:%d].", lo, hi, offset, l.LastIndex())
+	}
+	ents := make([]pb.Entry, hi-lo)
+	for k, ent := range l.entries[lo-offset : hi-offset] {
+		ents[k] = ent
+	}
+	return ents
+}
+
+func (l *RaftLog) tryMatch(i, t uint64) bool {
+	if i == 0 {
+		return true
+	}
+	if l.isEntriesEmpty() && i <= l.stabled {
+		log.Panicf("Try to match (i,t) = (%d,%d) in the raftLog which stabled = %d and entries is empty.", i, t, l.stabled)
+	}
+	if i > l.LastIndex() {
+		return false
+	}
+	offset := l.entries[0].Index
+	return (l.entries[i-offset].Term) == t
+}
+
+func (l *RaftLog) tryDeleteEnts(i uint64) {
+	if l.isEntriesEmpty() {
+		return
+	}
+	if i >= l.LastIndex() {
+		return
+	}
+	defer func() {
+		l.stabled = min(l.stabled, i)
+	}()
+	//TODO 为啥要和compact比较
+	i = max(l.hadCompacted(), i)
+	offset := l.entries[0].Index
+	l.entries = l.entries[0 : (i+1)-offset]
+}
+
+func (l *RaftLog) hadCompacted() uint64 {
+	snapshot, ssErr := l.storage.Snapshot()
+	if ssErr != nil {
+		panic(ssErr)
+	}
+	return snapshot.Metadata.Index
+}
+
+func (l *RaftLog) getCommited() uint64 {
 	return l.committed
 }
