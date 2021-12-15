@@ -252,6 +252,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	}
 	r.msgs = append(r.msgs, m)
 	return true
+
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -407,7 +408,11 @@ func (r *Raft) becomeLeader() {
 	}
 	// leader append a noop entry and send propose
 	r.appendEntry(emptyEntry)
-	r.bcastAppend()
+	if r.nPeers() == 1 {
+		r.RaftLog.tryCommit(r.RaftLog.LastIndex())
+	} else {
+		r.bcastAppend()
+	}
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -873,4 +878,51 @@ func (r *Raft) loadState(hs pb.HardState) {
 	r.RaftLog.committed = hs.Commit
 	r.Term = hs.Term
 	r.Vote = hs.Vote
+}
+
+// getMsgs get the msg from r.msgs, and return them to upper applications.
+func (r *Raft) getMsgs() []pb.Message {
+	if len(r.msgs) == 0 {
+		return nil
+	}
+	msgs := make([]pb.Message, 0, len(r.msgs))
+	rmsgs := make([]pb.Message, 0, len(r.msgs))
+	for _, msg := range r.msgs {
+		if msg.To == r.id {
+			rmsgs = append(rmsgs, msg)
+		} else {
+			msgs = append(msgs, msg)
+		}
+	}
+	r.msgs = rmsgs
+	return msgs
+}
+
+func (r *Raft) softState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.getCommited(),
+	}
+}
+
+func (r *Raft) advance(rd Ready) {
+	// TODO: Check here in part 2c
+	// handle the applied
+	if newApplied := rd.appliedCursor(); newApplied > 0 {
+		r.RaftLog.appliedTo(newApplied)
+	}
+	// TODO: handle the conf change in multi-raft or conf change
+	if len(rd.Entries) > 0 {
+		r.RaftLog.stableTo(rd.Entries[len(rd.Entries)-1].Index)
+	}
+	// TODO: handle the snapshot
+
 }

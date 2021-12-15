@@ -300,7 +300,7 @@ func (l *RaftLog) appliedTo(i uint64) {
 		log.Panicf("Try to applied to %d, but the commited is also %d", i, l.committed)
 	}
 	if i < l.applied {
-		log.Panicf("Try to applied to %d, buf the had applied is %d", i, l.committed)
+		log.Panicf("Try to applied to %d, but the old applied is %d", i, l.committed)
 	}
 	l.applied = i
 }
@@ -312,4 +312,15 @@ func (l *RaftLog) hadCompacted() uint64 {
 		panic(ssErr)
 	}
 	return snapshot.Metadata.Index
+}
+
+func (l *RaftLog) stableTo(i uint64) {
+	li := l.LastIndex()
+	if i > li {
+		log.Panicf("Try stabled to %d, but lastIndex is %d", i, li)
+	}
+	if i < l.stabled {
+		log.Panicf("Try stabled to %d, but oldStabled is %d", i, l.stabled)
+	}
+	l.stabled = i
 }
