@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"math/rand"
 	"time"
@@ -169,8 +170,7 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// get the hard state and the confState
-	// TODO: you need handle confState: hs, cs, err := c.Storage.InitialState()
-	hs, _, err := c.Storage.InitialState()
+	hs, cs, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err)
 	}
@@ -199,7 +199,17 @@ func newRaft(c *Config) *Raft {
 	r.votes = make(map[uint64]bool)
 	r.hadVotes = make(map[uint64]bool)
 	r.Prs = make(map[uint64]*Progress)
+	// The id in c.peers just used in test
 	for _, id := range c.peers {
+		r.votes[id] = false
+		r.hadVotes[id] = false
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  0,
+		}
+	}
+	// Read the true id from confstate.
+	for _, id := range cs.Nodes {
 		r.votes[id] = false
 		r.hadVotes[id] = false
 		r.Prs[id] = &Progress{
@@ -343,7 +353,7 @@ func (r *Raft) tick() {
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
-	// Reset Vote
+	// Reset VoteFor
 	r.Vote = 0
 	// Update term
 	r.Term = term
@@ -363,6 +373,7 @@ func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	// Increase term
 	r.increaseTerm()
+	log.Infof("Peer %d Become Candidate in term %d.", r.id, r.Term)
 	// reset electionElapsed and heartbeatElapsed
 	r.resetElectionElapsed()
 	r.resetHeartbeatElapsed()
@@ -379,6 +390,7 @@ func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// TODO: NOTE: Leader should propose a noop entry on its term
 	// Update leader
+	log.Infof("Peer %d Become Leader in term %d.", r.id, r.Term)
 	r.Lead = r.id
 	// Reset electionElapsed and heartbeatElapsed
 	r.resetElectionElapsed()
@@ -424,6 +436,7 @@ func (r *Raft) Step(m pb.Message) error {
 		// The list of the type of the pb.Message m need handle when the state of
 		// the peer r is StateFollower
 		switch m.MsgType {
+		case pb.MessageType_MsgPropose:
 		case pb.MessageType_MsgHup:
 			// Become Candidate
 			r.becomeCandidate()
@@ -466,6 +479,7 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 		case pb.MessageType_MsgPropose:
 			for _, ent := range m.Entries {
+				log.Infof("Peer %d receive a propose, data is : %v",r.id, ent.Data)
 				r.appendEntry(*ent)
 			}
 			if r.nPeers() == 1 {

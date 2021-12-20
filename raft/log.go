@@ -97,9 +97,10 @@ func newLog(storage Storage) *RaftLog {
 	// sErr is always be nil in the MemoryStorage.
 	snapshot, sErr := storage.Snapshot()
 	if sErr != nil {
-		panic(sErr)
+		//panic(sErr)
+	} else {
+		rl.applied = snapshot.Metadata.Index
 	}
-	rl.applied = snapshot.Metadata.Index
 	// Get the firstIndex and lastIndex from storage.
 	// TODO: check here if you modify the log logic.
 	fi, fiErr := storage.FirstIndex()
@@ -256,7 +257,7 @@ func (l *RaftLog) getCommited() uint64 {
 // tryMatch try to find a log which index is i and term is t
 func (l *RaftLog) tryMatch(i, t uint64) bool {
 	// tryMatch(0) will always return true.
-	if i == 0 {
+	if i == 0 || t == 0 {
 		return true
 	}
 	// Try to match a log which had been compacted.
@@ -285,7 +286,8 @@ func (l *RaftLog) tryDeleteEnts(i uint64) {
 	defer func() {
 		l.stabled = min(l.stabled, i)
 	}()
-	i = max(l.hadCompacted(), i)
+	// TODO: consider the snapshot and the storage of compacted
+	// i = max(l.hadCompacted(), i)
 	// delete the entries which are not been compacted and greater than i
 	offset := l.entries[0].Index
 	// `i` may less than offset, and it's a uint64, add brackets to avoid underflow

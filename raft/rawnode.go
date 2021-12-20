@@ -16,7 +16,6 @@ package raft
 
 import (
 	"errors"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -154,8 +153,9 @@ func (rn *RawNode) Ready() Ready {
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		Snapshot:         pb.Snapshot{},
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
-		Messages:         rn.Raft.getMsgs(),
+		//Messages:         rn.Raft.getMsgs(),
 	}
+	ready.Messages = rn.Raft.getMsgs()
 	if newSoft := rn.Raft.softState(); !newSoft.equal(rn.prevSoft) {
 		ready.SoftState = newSoft
 	}

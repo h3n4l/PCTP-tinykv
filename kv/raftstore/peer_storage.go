@@ -302,12 +302,47 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 		time.Since(start),
 	)
 	return nil
+
 }
 
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	// TODO: check here in part conf change.
+	// No need doing anything if the entries is empty
+	if len(entries) == 0 {
+		return nil
+	}
+	// Get the first index in stabled, it will not return an error
+	stableFirstIndex, _ := ps.FirstIndex()
+	stableLastIndex, _ := ps.LastIndex()
+	appendLastIndex := entries[len(entries)-1].Index
+	appendLastTerm := entries[len(entries)-1].Term
+	appendFirstIndex := entries[0].Index
+	if appendLastIndex < stableFirstIndex {
+		// Want to rewrite the log which had been compacted
+		return errors.New("[PeerStorage.Append()]:Try to rewrite the log which is truncated.")
+	}
+	// Drop the entry that had been compacted
+	if stableFirstIndex > appendFirstIndex {
+		entries = entries[stableFirstIndex-appendFirstIndex:]
+	}
+	// Add the entries to write batch
+	for _, ent := range entries {
+		// using refer: runner_test.go+122
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.GetId(), ent.Index), &ent)
+	}
+	// Delete the entries after appendLastIndex
+	if stableLastIndex > appendLastIndex {
+		for i := appendLastIndex + 1; i <= stableLastIndex; i++ {
+			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.GetId(), i))
+		}
+	}
+	// Update the RaftState
+	log.Debugf("%v modify the raftLocalState.LastIndex from %d to %d\n\t and the LastTerm from %d to %d", ps.Tag, stableLastIndex, appendLastIndex, ps.raftState.LastTerm, appendLastTerm)
+	ps.raftState.LastIndex = appendLastIndex
+	ps.raftState.LastTerm = appendLastTerm
 	return nil
 }
 
@@ -331,6 +366,22 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	// TODO: handle the snapshot
+	// Handle the entries that need stabled.
+	raftWB := new(engine_util.WriteBatch)
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
+		return nil, err
+	}
+	// Update hard state
+	if ready.HardState.Term != 0 {
+		ps.raftState.HardState = &ready.HardState
+	}
+	// Add the hard state in raftWB
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState)
+	// Write to Raft db
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 

@@ -390,3 +390,17 @@ func (p *peer) sendRaftMessage(msg eraftpb.Message, trans Transport) error {
 	sendMsg.Message = &msg
 	return trans.Send(sendMsg)
 }
+
+//func (p *peer) getProposalAndDelete(index uint64) (*proposal, error) {
+//	if len(p.proposals) == 0 {
+//		return nil, errors.New("Proposal is empty.")
+//	}
+//	propFirstIdx := p.proposals[0].index
+//	if index >= propFirstIdx+uint64(len(p.proposals)) || index < propFirstIdx {
+//		return nil, errors.New("Proposal out of range.")
+//	}
+//	propPos := index - propFirstIdx
+//	prop := p.proposals[propPos]
+//	p.proposals = append(p.proposals[:propPos], p.proposals[propPos+1:]...)
+//	return prop, nil
+//}
