@@ -479,7 +479,7 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 		case pb.MessageType_MsgPropose:
 			for _, ent := range m.Entries {
-				log.Infof("Peer %d receive a propose, data is : %v",r.id, ent.Data)
+				log.Infof("Peer %d receive a propose, data is : %v", r.id, ent.Data)
 				r.appendEntry(*ent)
 			}
 			if r.nPeers() == 1 {
@@ -541,7 +541,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		entp := m.Entries[0]
 		if match := r.RaftLog.tryMatch(entp.Index, entp.Term); !match {
 			// If it doesn't match, delete it and all logs after it
-			r.RaftLog.tryDeleteEnts(entp.Index - 1)
+			r.RaftLog.tryDeleteEntsAfterIndex(entp.Index - 1)
 			break
 		} else {
 			lastNewEntryIndex = entp.Index
@@ -746,6 +746,47 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	// just restore the raft internal state like the term, commit index and membership information, etc.
+	meta := m.Snapshot.Metadata
+	resp := pb.Message{
+		MsgType:  pb.MessageType_MsgAppendResponse,
+		To:       m.From,
+		From:     r.id,
+		Term:     r.Term,
+		LogTerm:  0,
+		Index:    0,
+		Entries:  nil,
+		Commit:   0,
+		Snapshot: nil,
+		Reject:   false,
+	}
+	defer func() {
+		resp.Index = r.RaftLog.LastIndex()
+		resp.Commit = r.RaftLog.getCommited()
+		r.msgs = append(r.msgs, resp)
+	}()
+	//TODO: compare the term and try become follower?
+	if meta.Index <= r.RaftLog.committed {
+		return
+	}
+	// Clean the log, and use the snapshot to reset the state machine
+	r.RaftLog.entries = make([]pb.Entry, 0)
+	r.RaftLog.committed, r.RaftLog.applied, r.RaftLog.stabled = meta.Index, meta.Index, meta.Index
+	// Reset the membership
+	r.Prs = make(map[uint64]*Progress)
+	r.votes = make(map[uint64]bool)
+	r.hadVotes = make(map[uint64]bool)
+	for _, id := range meta.ConfState.Nodes {
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  0,
+		}
+		r.votes[id] = false
+		r.hadVotes[id] = false
+	}
+	// pend it
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	return
 }
 
 // addNode add a new node to raft group

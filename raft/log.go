@@ -199,7 +199,11 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// 2. A raft system is at term 1, but follower had not received log(even the noop entry).
 	// 3. All stabled entries are compacted.
 	if l.isEntriesEmpty() {
-		return 0, EntriesUnavailable
+		term, err := l.storage.Term(i)
+		if i == l.pendingSnapshot.Metadata.Index {
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+		return term, err
 	}
 	offset := l.entries[0].Index
 	if i > l.LastIndex() || i < offset {
@@ -274,8 +278,8 @@ func (l *RaftLog) tryMatch(i, t uint64) bool {
 	return (l.entries[i-offset].Term) == t
 }
 
-// tryDeleteEnts will try to delete the entries which index > i
-func (l *RaftLog) tryDeleteEnts(i uint64) {
+// tryDeleteEntsAfterIndex will try to delete the entries which index > i
+func (l *RaftLog) tryDeleteEntsAfterIndex(i uint64) {
 	// No entries can be delete.
 	if l.isEntriesEmpty() {
 		return
@@ -293,6 +297,18 @@ func (l *RaftLog) tryDeleteEnts(i uint64) {
 	offset := l.entries[0].Index
 	// `i` may less than offset, and it's a uint64, add brackets to avoid underflow
 	l.entries = l.entries[0 : (i+1)-offset]
+}
+
+// tryDeleteEntsBeforeIndex will try to delete the entries which index <= i
+func (l *RaftLog) tryDeleteEntsBeforeIndex(i uint64) {
+	if l.isEntriesEmpty() {
+		return
+	}
+	offset := l.entries[0].Index
+	if offset > i {
+		return
+	}
+	l.entries = l.entries[i-offset+1:]
 }
 
 func (l *RaftLog) appliedTo(i uint64) {
