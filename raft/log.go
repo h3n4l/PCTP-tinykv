@@ -93,14 +93,15 @@ func newLog(storage Storage) *RaftLog {
 		panic(isErr)
 	}
 	rl.committed = hs.Commit
+	// TODO: ? Don't need get snapshot when you new a log?
 	// Read the applied index from snapshot in storage
 	// sErr is always be nil in the MemoryStorage.
-	snapshot, sErr := storage.Snapshot()
-	if sErr != nil {
-		//panic(sErr)
-	} else {
-		rl.applied = snapshot.Metadata.Index
-	}
+	//snapshot, sErr := storage.Snapshot()
+	//if sErr != nil {
+	//	//panic(sErr)
+	//} else {
+	//	rl.applied = snapshot.Metadata.Index
+	//}
 	// Get the firstIndex and lastIndex from storage.
 	// TODO: check here if you modify the log logic.
 	fi, fiErr := storage.FirstIndex()
