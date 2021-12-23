@@ -3,6 +3,7 @@ package mvcc
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/codec"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
@@ -104,6 +105,34 @@ func (txn *MvccTxn) DeleteLock(key []byte) {
 // I.e., the most recent value committed before the start of this transaction.
 func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 	// Your Code Here (4A).
+	it := txn.Reader.IterCF("write")
+	for it.Valid() {
+		item := it.Item()
+		userKey := DecodeUserKey(item.Key())
+		if isSameKey(userKey, key) {
+			iv, ivErr := item.Value()
+			if ivErr != nil {
+				return nil, ivErr
+			}
+			write, pErr := ParseWrite(iv)
+			if pErr != nil {
+				return nil, pErr
+			}
+			if write.Kind == WriteKindDelete {
+				return nil, nil
+			}
+			ts := write.StartTS
+			fmt.Println(ts)
+			encodeKey := EncodeKey(key, ts)
+			value, vErr := txn.Reader.GetCF("default", encodeKey)
+			if vErr != nil {
+				return nil, vErr
+			} else {
+				return value, nil
+			}
+		}
+		it.Next()
+	}
 	return nil, nil
 }
 
@@ -152,19 +181,42 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 			if vErr != nil {
 				return nil, 0, vErr
 			}
-			w, vErr := ParseWrite(value)
-			cTs := decodeTimestamp(item.Key())
-			return w, cTs, nil
+			w, wErr := ParseWrite(value)
+			if wErr != nil {
+				return nil, 0, wErr
+			}
+			if w.StartTS == txn.StartTS {
+				cTs := decodeTimestamp(item.Key())
+				return w, cTs, nil
+			}
 		}
 		it.Next()
 	}
-	return &Write{}, 0, nil
+	return nil, 0, nil
 }
 
 // MostRecentWrite finds the most recent write with the given key. It returns a Write from the DB and that
 // write's commit timestamp, or an error.
 func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 	// Your Code Here (4A).
+	it := txn.Reader.IterCF("write")
+	for it.Valid() {
+		item := it.Item()
+		userKey := DecodeUserKey(item.Key())
+		if isSameKey(userKey, key) {
+			value, vErr := item.Value()
+			if vErr != nil {
+				return nil, 0, vErr
+			}
+			w, wErr := ParseWrite(value)
+			if wErr != nil {
+				return nil, 0, wErr
+			}
+			cTs := decodeTimestamp(item.Key())
+			return w, cTs, nil
+		}
+		it.Next()
+	}
 	return nil, 0, nil
 }
 
