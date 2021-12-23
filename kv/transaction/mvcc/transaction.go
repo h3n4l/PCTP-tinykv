@@ -3,7 +3,6 @@ package mvcc
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/codec"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
@@ -121,14 +120,18 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 			if write.Kind == WriteKindDelete {
 				return nil, nil
 			}
-			ts := write.StartTS
-			fmt.Println(ts)
-			encodeKey := EncodeKey(key, ts)
-			value, vErr := txn.Reader.GetCF("default", encodeKey)
-			if vErr != nil {
-				return nil, vErr
-			} else {
-				return value, nil
+			timestamp := decodeTimestamp(item.Key())
+			println(timestamp)
+			if timestamp > txn.StartTS {
+				continue
+			}
+			if write.StartTS < txn.StartTS {
+				e := EncodeKey(key, write.StartTS)
+				v, Err := txn.Reader.GetCF("default", e)
+				if Err != nil {
+					return nil, Err
+				}
+				return v, nil
 			}
 		}
 		it.Next()
