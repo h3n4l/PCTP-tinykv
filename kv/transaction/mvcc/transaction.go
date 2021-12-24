@@ -109,27 +109,27 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 		item := it.Item()
 		userKey := DecodeUserKey(item.Key())
 		if isSameKey(userKey, key) {
-			iv, ivErr := item.Value()
-			if ivErr != nil {
-				return nil, ivErr
+			iv, iErr := item.Value()
+			if iErr != nil {
+				return nil, iErr
 			}
 			write, pErr := ParseWrite(iv)
 			if pErr != nil {
 				return nil, pErr
 			}
-			if write.Kind == WriteKindDelete {
+			its := decodeTimestamp(item.Key())
+			if write.Kind == WriteKindDelete && its == txn.StartTS {
 				return nil, nil
 			}
-			timestamp := decodeTimestamp(item.Key())
-			println(timestamp)
-			if timestamp > txn.StartTS {
+			if txn.StartTS < its {
+				it.Next()
 				continue
 			}
 			if write.StartTS < txn.StartTS {
 				e := EncodeKey(key, write.StartTS)
-				v, Err := txn.Reader.GetCF("default", e)
-				if Err != nil {
-					return nil, Err
+				v, rErr := txn.Reader.GetCF("default", e)
+				if rErr != nil {
+					return nil, rErr
 				}
 				return v, nil
 			}
