@@ -220,9 +220,7 @@ func newRaft(c *Config) *Raft {
 	if !IsEmptyHardState(hs) {
 		r.loadState(hs)
 	}
-	if c.Applied > 0 {
-		r.RaftLog.appliedTo(c.Applied)
-	}
+	r.RaftLog.appliedTo(c.Applied)
 	// Set random seed
 	rand.Seed(time.Now().Unix())
 	return r
@@ -255,14 +253,17 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// TODO: Modify here if you want to handle the error.
 	lt, _ := r.RaftLog.Term(r.Prs[to].Next - 1)
 	m.LogTerm = lt
-	m.Entries = make([]*pb.Entry, r.RaftLog.LastIndex()+1-r.Prs[to].Next)
-	ents := r.RaftLog.getEnts(r.Prs[to].Next, r.RaftLog.LastIndex()+1)
+	if r.RaftLog.LastIndex()+1 < r.Prs[to].Next {
+		log.Panicf("Peer %d : r.RaftLog.LastIndex() + 1 = %d, but r.Prs[%d].Next = %d", r.id, r.RaftLog.LastIndex()+1, to, r.Prs[to].Next)
+	}
+	m.Entries = make([]*pb.Entry, 0, r.RaftLog.LastIndex()+1-r.Prs[to].Next)
+	ents := r.RaftLog.getEntsInMem(r.Prs[to].Next, r.RaftLog.LastIndex()+1)
 	for k := range ents {
-		m.Entries[k] = &ents[k]
+		m.Entries = append(m.Entries, &ents[k])
+		//m.Entries[k] = &ents[k]
 	}
 	r.msgs = append(r.msgs, m)
 	return true
-
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -281,9 +282,13 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		LogTerm:  0,
 		Index:    0,
 		Entries:  nil,
-		Commit:   r.RaftLog.getCommited(),
+		Commit:   0,
 		Snapshot: nil, // TODO: modify here in 2AC snapshot
 		Reject:   false,
+	}
+	// Only commit this term entry by calculate backup.
+	if t, err := r.RaftLog.Term(r.RaftLog.getCommited()); err != nil && t == r.Term {
+		heartbeatMessage.Commit = r.RaftLog.getCommited()
 	}
 	r.msgs = append(r.msgs, heartbeatMessage)
 }
@@ -443,12 +448,10 @@ func (r *Raft) Step(m pb.Message) error {
 			// Send request vote to all the nodes in this cluster.
 			r.bcastRequestVote()
 		case pb.MessageType_MsgAppend:
-			r.Lead = m.From
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handleRequestVote(m)
 		case pb.MessageType_MsgHeartbeat:
-			r.Lead = m.From
 			r.handleHeartbeat(m)
 		}
 
@@ -479,7 +482,7 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 		case pb.MessageType_MsgPropose:
 			for _, ent := range m.Entries {
-				log.Infof("Peer %d receive a propose, data is : %v", r.id, ent.Data)
+				log.Infof("Peer %d receive a propose, index is %d, data is : %v", r.id, r.RaftLog.LastIndex()+1, ent.Data)
 				r.appendEntry(*ent)
 			}
 			if r.nPeers() == 1 {
@@ -516,26 +519,33 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		To:       m.From,
 		From:     r.id,
 		Term:     r.Term,
-		LogTerm:  0,
-		Index:    0,
+		LogTerm:  m.LogTerm,
+		Index:    m.Index,
 		Entries:  nil,
 		Commit:   0,
 		Snapshot: nil,
 		Reject:   false,
 	}
 	defer func() {
+		if !appendResp.Reject {
+			r.Lead = m.From
+		}
 		r.msgs = append(r.msgs, appendResp)
 	}()
+	// Reject if sender is overdue of term.
 	if m.Term < r.Term {
 		appendResp.Reject = true
 		return
 	}
 	// Try to match the prevIndex and prevTerm
 	if match := r.RaftLog.tryMatch(m.Index, m.LogTerm); !match {
+		log.Infof("Raft %d try match (%d,%d), but false, so reject.", r.id, m.Index, m.LogTerm)
+		// Reject if log don't match, resp.Index and resp.Term are same as the m
 		appendResp.Reject = true
 		return
 	}
 	// append the entry in my log
+	// Record the new appendEntry
 	lastNewEntryIndex := m.Index
 	for len(m.Entries) != 0 {
 		entp := m.Entries[0]
@@ -547,6 +557,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			lastNewEntryIndex = entp.Index
 			m.Entries = m.Entries[1:]
 		}
+	}
+	if len(m.Entries) != 0 {
+		log.Infof("Raft %d receive log from peer %d range [%d,%d]", r.id, m.From, m.Entries[0].Index, m.Entries[len(m.Entries)-1].Index)
 	}
 	for _, entp := range m.Entries {
 		lastNewEntryIndex = entp.Index
@@ -567,8 +580,58 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.RaftLog.tryCommit(min(lastNewEntryIndex, m.Commit))
 	}
 	appendResp.Commit = r.RaftLog.getCommited()
-	appendResp.Index = r.RaftLog.LastIndex()
+	appendResp.Index = lastNewEntryIndex
+	t, _ := r.RaftLog.Term(appendResp.Index)
+	appendResp.LogTerm = t
 	return
+}
+
+func (r *Raft) handleAppendResponse(m pb.Message) {
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, m.From)
+		return
+	}
+	if m.Term < r.Term {
+		return
+	}
+	// If m.From reject append RPC because of don't match the prevLog, decrease the r.Prs[to].Next
+	if m.Reject && m.Index == r.Prs[m.From].Next-1 {
+		r.Prs[m.From].Next -= 1
+		// if reject, need send again with new next
+		r.sendAppend(m.From)
+		return
+	}
+	r.Prs[m.From].Next = m.Index + 1
+	r.Prs[m.From].Match = m.Index
+	lt, _ := r.RaftLog.Term(r.Prs[m.From].Next - 1)
+	// The leader only commits the logs for the current term by calculating copies
+	if r.Term != lt {
+		return
+	}
+	if r.nCopied(r.Prs[m.From].Match) >= r.nPeers()/2+1 && r.RaftLog.getCommited() < r.Prs[m.From].Match {
+		updateCommit := r.RaftLog.tryCommit(r.Prs[m.From].Match)
+		// Tell all followers the newest commit index, it will only send once per peer, but it is safe
+		if updateCommit {
+			for id := range r.Prs {
+				if id == r.id {
+					continue
+				}
+				cm := pb.Message{
+					MsgType: pb.MessageType_MsgAppend,
+					To:      id,
+					From:    r.id,
+					Term:    r.Term,
+					LogTerm: 0,
+					Index:   r.Prs[m.From].Match,
+					Entries: nil,
+					Commit:  r.RaftLog.getCommited(),
+				}
+				lt, _ = r.RaftLog.Term(r.Prs[r.id].Match)
+				cm.LogTerm = lt
+				r.msgs = append(r.msgs, cm)
+			}
+		}
+	}
 }
 
 // handleRequestVote handle RequestVote RPC request
@@ -663,6 +726,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 		return
 	}
+	r.Lead = m.From
 	resp := pb.Message{
 		MsgType:  pb.MessageType_MsgHeartbeatResponse,
 		To:       m.From,
@@ -698,95 +762,9 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	}
 }
 
-func (r *Raft) handleAppendResponse(m pb.Message) {
-	if m.Term > r.Term {
-		r.becomeFollower(m.Term, m.From)
-		return
-	}
-	// check the reject
-	if m.Reject {
-		r.Prs[m.From].Next -= 1
-		// if reject, need send again with new next
-		r.sendAppend(m.From)
-		return
-	}
-	r.Prs[m.From].Next = m.Index + 1
-	r.Prs[m.From].Match = m.Index
-	lt, _ := r.RaftLog.Term(r.Prs[m.From].Next - 1)
-	// The leader only commits the logs for the current term by calculating copies
-	if r.Term == lt {
-		if r.nCopied(r.Prs[m.From].Match) >= r.nPeers()/2+1 && r.RaftLog.getCommited() < r.Prs[m.From].Match {
-			updateCommit := r.RaftLog.tryCommit(r.Prs[m.From].Match)
-			// Tell all followers the newest commit index, it will only send once per peer, but it is safe
-			if updateCommit {
-				for id := range r.Prs {
-					if id == r.id {
-						continue
-					}
-					cm := pb.Message{
-						MsgType: pb.MessageType_MsgAppend,
-						To:      id,
-						From:    r.id,
-						Term:    r.Term,
-						LogTerm: 0,
-						Index:   r.Prs[r.id].Next - 1,
-						Entries: nil,
-						Commit:  r.RaftLog.getCommited(),
-					}
-					lt, _ = r.RaftLog.Term(r.Prs[id].Next - 1)
-					cm.LogTerm = lt
-					r.msgs = append(r.msgs, cm)
-				}
-			}
-		}
-
-	}
-}
-
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
-	// just restore the raft internal state like the term, commit index and membership information, etc.
-	meta := m.Snapshot.Metadata
-	resp := pb.Message{
-		MsgType:  pb.MessageType_MsgAppendResponse,
-		To:       m.From,
-		From:     r.id,
-		Term:     r.Term,
-		LogTerm:  0,
-		Index:    0,
-		Entries:  nil,
-		Commit:   0,
-		Snapshot: nil,
-		Reject:   false,
-	}
-	defer func() {
-		resp.Index = r.RaftLog.LastIndex()
-		resp.Commit = r.RaftLog.getCommited()
-		r.msgs = append(r.msgs, resp)
-	}()
-	//TODO: compare the term and try become follower?
-	if meta.Index <= r.RaftLog.committed {
-		return
-	}
-	// Clean the log, and use the snapshot to reset the state machine
-	r.RaftLog.entries = make([]pb.Entry, 0)
-	r.RaftLog.committed, r.RaftLog.applied, r.RaftLog.stabled = meta.Index, meta.Index, meta.Index
-	// Reset the membership
-	r.Prs = make(map[uint64]*Progress)
-	r.votes = make(map[uint64]bool)
-	r.hadVotes = make(map[uint64]bool)
-	for _, id := range meta.ConfState.Nodes {
-		r.Prs[id] = &Progress{
-			Match: 0,
-			Next:  0,
-		}
-		r.votes[id] = false
-		r.hadVotes[id] = false
-	}
-	// pend it
-	r.RaftLog.pendingSnapshot = m.Snapshot
-	return
 }
 
 // addNode add a new node to raft group
@@ -823,6 +801,7 @@ func (r *Raft) nPeers() uint64 {
 	return uint64(len(r.Prs))
 }
 
+// increaseTerm will do term+=1
 func (r *Raft) increaseTerm() {
 	r.Term += 1
 }
@@ -891,7 +870,6 @@ func (r *Raft) bcastRequestVote() {
 		}
 	}
 }
-
 func (r *Raft) appendEntry(ents ...pb.Entry) {
 	li := r.RaftLog.LastIndex()
 	switch r.State {
@@ -979,5 +957,4 @@ func (r *Raft) advance(rd Ready) {
 		r.RaftLog.stableTo(rd.Entries[len(rd.Entries)-1].Index)
 	}
 	// TODO: handle the snapshot
-
 }

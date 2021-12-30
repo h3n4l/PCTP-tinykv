@@ -200,16 +200,16 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// 3. All stabled entries are compacted.
 	if l.isEntriesEmpty() {
 		term, err := l.storage.Term(i)
-		if i == l.pendingSnapshot.Metadata.Index {
-			return l.pendingSnapshot.Metadata.Term, nil
-		}
 		return term, err
 	}
 	offset := l.entries[0].Index
-	if i > l.LastIndex() || i < offset {
+	if i > l.LastIndex() {
 		// If the index is greater than the LastIndex or try to get a term which had been compacted,
 		// it will return an error
 		return 0, EntriesUnavailable
+	}
+	if i < offset {
+		return l.storage.Term(i)
 	}
 	return l.entries[i-offset].Term, nil
 }
@@ -227,15 +227,15 @@ func (l *RaftLog) append(ents ...pb.Entry) {
 	l.entries = append(l.entries, ents...)
 }
 
-// getEnts returns the index of entries in range [lo, hi)
-func (l *RaftLog) getEnts(lo uint64, hi uint64) []pb.Entry {
+// getEntsInMem returns the index of entries in range [lo, hi) in mem.
+func (l *RaftLog) getEntsInMem(lo uint64, hi uint64) []pb.Entry {
 	if l.isEntriesEmpty() {
 		panic("Entries of RaftLog is empty.")
 	}
 	offset := l.entries[0].Index
 	// May be a erroneous request or try to get a entry which had been compacted.
 	if lo < offset || hi > l.LastIndex()+1 {
-		log.Panicf("Try get ents [%d:%d] out of range [%d:%d].", lo, hi, offset, l.LastIndex())
+		log.Panicf("Try get ents [%d:%d) out of range [%d:%d].", lo, hi, offset, l.LastIndex())
 	}
 	ents := make([]pb.Entry, hi-lo)
 	for k, ent := range l.entries[lo-offset : hi-offset] {
@@ -265,16 +265,38 @@ func (l *RaftLog) tryMatch(i, t uint64) bool {
 	if i == 0 || t == 0 {
 		return true
 	}
+	if i > l.LastIndex() {
+		return false
+	}
 	// Try to match a log which had been compacted.
-	if l.isEntriesEmpty() && i <= l.stabled {
+	// Match in storage
+	if l.isEntriesEmpty() {
 		// TODO: return false instead?
-		log.Panicf("Try to match (i,t) = (%d,%d) in the raftLog which stabled = %d and entries is empty.", i, t, l.stabled)
+		term, err := l.storage.Term(i)
+		if err != nil {
+			log.Panic(err)
+		}
+		if t != term {
+			return false
+		}
+		return true
 	}
 	// Try to match a log that has not been received
 	if i > l.LastIndex() {
 		return false
 	}
 	offset := l.entries[0].Index
+	// Match in storage
+	if i < offset {
+		term, err := l.storage.Term(i)
+		if err != nil {
+			log.Panic(err)
+		}
+		if t != term {
+			return false
+		}
+		return true
+	}
 	return (l.entries[i-offset].Term) == t
 }
 
@@ -287,9 +309,14 @@ func (l *RaftLog) tryDeleteEntsAfterIndex(i uint64) {
 	if i >= l.LastIndex() {
 		return
 	}
+	// We hope no delete the entries that are applied.
+	if i < l.applied {
+		log.Panicf("Try delete the entry range [%d,%d] but applied is %d", i+1, l.LastIndex(), l.applied)
+	}
 	// Before return, need update the stable
 	defer func() {
 		l.stabled = min(l.stabled, i)
+		l.committed = min(l.committed, i)
 	}()
 	// TODO: consider the snapshot and the storage of compacted
 	// i = max(l.hadCompacted(), i)
@@ -299,23 +326,12 @@ func (l *RaftLog) tryDeleteEntsAfterIndex(i uint64) {
 	l.entries = l.entries[0 : (i+1)-offset]
 }
 
-// tryDeleteEntsBeforeIndex will try to delete the entries which index <= i
-func (l *RaftLog) tryDeleteEntsBeforeIndex(i uint64) {
-	if l.isEntriesEmpty() {
-		return
-	}
-	offset := l.entries[0].Index
-	if offset > i {
-		return
-	}
-	l.entries = l.entries[i-offset+1:]
-}
-
+// appliedTo update the applied to i, it will panic if i > committed or i < applied.
 func (l *RaftLog) appliedTo(i uint64) {
 	if i == 0 {
 		return
 	}
-	if l.committed < i {
+	if i > l.committed {
 		log.Panicf("Try to applied to %d, but the commited is also %d", i, l.committed)
 	}
 	if i < l.applied {
@@ -324,15 +340,7 @@ func (l *RaftLog) appliedTo(i uint64) {
 	l.applied = i
 }
 
-// hadCompacted will return the highest position of log which is compacted.
-func (l *RaftLog) hadCompacted() uint64 {
-	snapshot, ssErr := l.storage.Snapshot()
-	if ssErr != nil {
-		panic(ssErr)
-	}
-	return snapshot.Metadata.Index
-}
-
+// stableTo update the stabled to i, it will panic if i > lastIndex or i < stabled.
 func (l *RaftLog) stableTo(i uint64) {
 	li := l.LastIndex()
 	if i > li {

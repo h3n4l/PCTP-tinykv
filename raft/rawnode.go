@@ -194,7 +194,6 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.prevHard = rd.HardState
 	}
 	rn.Raft.advance(rd)
-
 }
 
 // GetProgress return the Progress of this node and its peers, if this

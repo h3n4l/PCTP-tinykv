@@ -237,7 +237,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 			continue
 		}
 		if resp.Header.Error != nil {
-			log.Infof("CallCommandOnLeader: receive resp: %v", resp)
+			//log.Infof("CallCommandOnLeader: receive resp: %v", resp)
 			err := resp.Header.Error
 			if err.GetStaleCommand() != nil || err.GetEpochNotMatch() != nil || err.GetNotLeader() != nil {
 				log.Debugf("encouter retryable err %+v", resp)

@@ -66,7 +66,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		for _, ent := range rd.CommittedEntries {
 			switch ent.EntryType {
 			case eraftpb.EntryType_EntryNormal:
-				d.processNormalCommitted(ent)
+				//d.processNormalCommitted(ent)
+				d.processNormalCommittedEntry(ent)
 			case eraftpb.EntryType_EntryConfChange:
 				// TODO: handle the conf change entry
 			}
@@ -75,19 +76,47 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	d.RaftGroup.Advance(rd)
 }
 
-//processCommitted process the entries that had been committed, apply them to the state-machine
-func (d *peerMsgHandler) processNormalCommitted(entry eraftpb.Entry) {
-	// Unmarshall the request
-	var req raft_cmdpb.Request
-	err := proto.Unmarshal(entry.Data, &req)
+// processNormalCommittedEntry will handle the committed entry, included response, apply...
+func (d *peerMsgHandler) processNormalCommittedEntry(ent eraftpb.Entry) {
+	// Unmarshall to get the request
+	if ent.Data == nil {
+		// For Noop entry
+		d.handleProposal(ent.Index, ent.Term)
+		// To update the applied state to kv db
+		d.appliedNormalRaftCmdRequest([]*raft_cmdpb.Request{
+			{
+				CmdType: raft_cmdpb.CmdType_Invalid,
+			},
+		})
+	}
+	var cmdRequest raft_cmdpb.RaftCmdRequest
+	err := proto.Unmarshal(ent.Data, &cmdRequest)
 	if err != nil {
-		log.Panicf("Unmarshal Error.")
+		panic(err)
 	}
-	if req.CmdType == raft_cmdpb.CmdType_Invalid {
-		// Means this entry that is a noop entry appeared when a node become leader, don't handle it
-		return
+	if cmdRequest.AdminRequest != nil {
+		// TODO: handle admin request
+	} else if len(cmdRequest.Requests) != 0 {
+		d.appliedNormalRaftCmdRequest(cmdRequest.Requests)
+		prop := d.handleProposal(ent.Index, ent.Term)
+		if prop != nil {
+			resp := d.getResponseOfNormalRaftCmdRequest(cmdRequest.Requests, prop)
+			prop.cb.Done(resp)
+		}
 	}
-	// log.Infof("Peer %d process the request from log index: %d : %v", d.PeerId(), entry.Index, req)
+}
+
+// appliedNormalRaftCmdRequest applied the request in `reqs`
+func (d *peerMsgHandler) appliedNormalRaftCmdRequest(reqs []*raft_cmdpb.Request) {
+	if len(reqs) != 1 {
+		log.Panicf("many reqs")
+	}
+	for i := 1; i < len(reqs); i++ {
+		if reqs[i].CmdType != reqs[i-1].CmdType {
+			log.Panicf("Many normal request type")
+		}
+	}
+	req := reqs[0]
 	// New a writeBranch
 	kvWB := new(engine_util.WriteBatch)
 	// Apply to kv db
@@ -100,34 +129,68 @@ func (d *peerMsgHandler) processNormalCommitted(entry eraftpb.Entry) {
 	case raft_cmdpb.CmdType_Snap:
 		//TODO: handle the snapshot
 	}
-	cmdResp, cb := d.processRequestResponse(req, entry.Index, entry.Term)
 	// Update the applied index
 	d.peerStorage.applyState.AppliedIndex += 1
-	// Add in kvWB
 	kvWB.SetMeta(meta.ApplyStateKey(d.Region().GetId()), d.peerStorage.applyState)
-	err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
-	if err != nil {
-		// TODO: consider roll back the applied index?
-		// TODO: consider set the err in cmdResponse
-	}
-	if cb != nil {
-		log.Infof("Peer %d apply the log index(%d,%d), and Done the callBack(%p) with %v", d.PeerId(), entry.Index, entry.Term, cb, *cmdResp)
-		cb.Done(cmdResp)
-	}
+	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 }
 
-func (d *peerMsgHandler) processRequestResponse(req raft_cmdpb.Request, index uint64, term uint64) (*raft_cmdpb.RaftCmdResponse, *message.Callback) {
-	// Try to get the proposal in peer
-	if len(d.proposals) == 0 {
-		// We will don't reply if it's a follower when receive this request
-		return nil, nil
+// getResponseOfNormalRaftCmdRequest will return the response of request and proposal, caller need protect
+// reqs are not nil and prop is not nil
+func (d *peerMsgHandler) getResponseOfNormalRaftCmdRequest(reqs []*raft_cmdpb.Request, prop *proposal) *raft_cmdpb.RaftCmdResponse {
+	if len(reqs) != 1 {
+		log.Panicf("many reqs")
 	}
+	for i := 1; i < len(reqs); i++ {
+		if reqs[i].CmdType != reqs[i-1].CmdType {
+			log.Panicf("Many normal request type")
+		}
+	}
+	req := reqs[0]
 	cmdResp := &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{
 			CurrentTerm: d.Term(),
 		},
 	}
-	prop := d.proposals[0]
+	switch req.CmdType {
+	case raft_cmdpb.CmdType_Get:
+		value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+		if err != nil {
+			value = nil
+		}
+		cmdResp.Responses = []*raft_cmdpb.Response{{
+			CmdType: raft_cmdpb.CmdType_Get,
+			Get: &raft_cmdpb.GetResponse{
+				Value: value,
+			},
+		}}
+	case raft_cmdpb.CmdType_Put:
+		cmdResp.Responses = []*raft_cmdpb.Response{{
+			CmdType: raft_cmdpb.CmdType_Put,
+		}}
+	case raft_cmdpb.CmdType_Delete:
+		cmdResp.Responses = []*raft_cmdpb.Response{{
+			CmdType: raft_cmdpb.CmdType_Delete,
+		}}
+	case raft_cmdpb.CmdType_Snap:
+		// TODO: handle the snapshot
+		cmdResp.Responses = []*raft_cmdpb.Response{{
+			CmdType: raft_cmdpb.CmdType_Snap,
+			Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+		}}
+		prop.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+	}
+	return cmdResp
+
+}
+
+// handleProposal try to return the proposal in peerMsgHandler which index and term are matched with args, and
+// it will notify stale command of that prop.index < index || (prop.index == index && prop.term != term), if no
+// match proposal, it will return nil after notify stale proposal.
+func (d *peerMsgHandler) handleProposal(index, term uint64) *proposal {
+	if len(d.proposals) == 0 {
+		return nil
+	}
 	// Match the index and the term
 	// There are some situations that we need consider:
 	// Assume we have 3 nodes(1,2,3)
@@ -136,57 +199,38 @@ func (d *peerMsgHandler) processRequestResponse(req raft_cmdpb.Request, index ui
 	// log[index:1, term:2], and commit and apply it. 1 will overwrite its log to consist with 2. And it
 	// apply log[index:1,term:2] will discover that it has a proposal[index:1, term:1], you will find that
 	// index is equal, but term are different, it needs return StaleCommand.
+
 	// B: As same as situation A, but 1 failed after it commit but before applying, 2 is the leader in term2,
 	// receive propose from clients, save it as log[index:2,term:2], and commit and apply. When 1 restarts,
 	// it will apply the log[index:1,term:1] and handle the proposal[index:1,term:1]
+
 	// C: As same as situation B, but 2 failed before apply, and 3 become leader, receive a proposal, save it
 	// as log[index:3,term 3], and copy it to 1. And failed before apply again, and 1 become leader, receive
 	// propose from clients, save it as log[index:4, term:4]. Now, 1 has 2 proposals[index:1,term:1]
 	// and [index:4,term:4]. So 1 get the proposal[index:4,term:4] when apply the log[index:2,term:2],
 	// you will find that index and term are not equal both. Just not reply.
 
-	// not return resp if peer is follower when receive the request
-	if prop.index != index {
-		return nil, nil
-	}
-	// log.Infof("Peer %d get a proposal [%d,%d], remain: %d", d.PeerId(), prop.index, prop.term, len(d.proposals)-1)
-	// return stale command
-	if prop.index == index && prop.term != term {
-		BindRespError(cmdResp, &util.ErrStaleCommand{})
-		d.proposals = d.proposals[1:]
-		return cmdResp, prop.cb
-	}
-	// return normal
-	switch req.CmdType {
-	case raft_cmdpb.CmdType_Get:
-		value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
-		if err != nil {
-			value = nil
+	// Notify the Stale command
+	for len(d.proposals) > 0 {
+		prop := d.proposals[0]
+		if prop.index < index || (prop.index == index && prop.term != term) {
+			NotifyStaleReq(d.Term(), prop.cb)
+			d.proposals = d.proposals[1:]
+		} else {
+			break
 		}
-		cmdResp.Responses = []*raft_cmdpb.Response{&raft_cmdpb.Response{
-			CmdType: raft_cmdpb.CmdType_Get,
-			Get: &raft_cmdpb.GetResponse{
-				Value: value,
-			},
-		}}
-	case raft_cmdpb.CmdType_Put:
-		cmdResp.Responses = []*raft_cmdpb.Response{&raft_cmdpb.Response{
-			CmdType: raft_cmdpb.CmdType_Put,
-		}}
-	case raft_cmdpb.CmdType_Delete:
-		cmdResp.Responses = []*raft_cmdpb.Response{&raft_cmdpb.Response{
-			CmdType: raft_cmdpb.CmdType_Delete,
-		}}
-	case raft_cmdpb.CmdType_Snap:
-		cmdResp.Responses = []*raft_cmdpb.Response{&raft_cmdpb.Response{
-			CmdType: raft_cmdpb.CmdType_Snap,
-			Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
-		}}
-		prop.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-		// TODO: handle the snapshot
 	}
-	d.proposals = d.proposals[1:]
-	return cmdResp, prop.cb
+
+	if len(d.proposals) > 0 {
+		prop := d.proposals[0]
+		// Correct proposal
+		if prop.index == index && prop.term == term {
+			d.proposals = d.proposals[1:]
+			return prop
+		}
+	}
+	// Further proposal
+	return nil
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -225,7 +269,7 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	regionID := d.regionId
 	leaderID := d.LeaderId()
 	if !d.IsLeader() {
-		log.Errorf("Peer %d receive a propose, but it no leader.", d.PeerId())
+		//log.Errorf("Peer %d receive a propose, but it no leader.", d.PeerId())
 		leader := d.getPeerFromCache(leaderID)
 		return &util.ErrNotLeader{RegionId: regionID, Leader: leader}
 	}
@@ -262,7 +306,6 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	// TODO: Handle the Admin Request, it will not enclose normal requests and administrator request in a `msg`
 	// Raft command can only send to leader
 	if d.RaftGroup.Raft.State != raft.StateLeader {
-
 		cmdResp := &raft_cmdpb.RaftCmdResponse{
 			Header: &raft_cmdpb.RaftResponseHeader{},
 		}
@@ -272,21 +315,19 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		})
 		cb.Done(cmdResp)
 	}
-	// Handle the request in loop
-	for _, req := range msg.Requests {
-		data, err := proto.Marshal(req)
-		if err != nil {
-			log.Panicf("Marshal Error, msg: %v", msg)
-		}
-		p := &proposal{
-			index: d.nextProposalIndex(),
-			term:  d.Term(),
-			cb:    cb,
-		}
-		d.RaftGroup.Propose(data)
-		d.proposals = append(d.proposals, p)
-		//log.Infof("Peer %d save a proposal [%d,%d],cb : %p, len: %d", d.PeerId(), p.index, p.term, cb, len(d.proposals))
+	// Propose the CmdRequest
+	data, merr := proto.Marshal(msg)
+	if merr != nil {
+		log.Panic(merr)
 	}
+	p := &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	}
+	d.RaftGroup.Propose(data)
+	d.proposals = append(d.proposals, p)
+	log.Infof("Peer %d save a proposal %v", d.PeerId(), p)
 }
 
 func (d *peerMsgHandler) onTick() {
