@@ -122,6 +122,7 @@ func newLog(storage Storage) *RaftLog {
 		rl.entries = ents
 	}
 	// set the stabled
+	rl.applied = fi - 1
 	rl.stabled = li
 	return rl
 }
@@ -193,14 +194,23 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if i == 0 {
 		return 0, nil
 	}
+	// Find in pending snapshot
+	if l.pendingSnapshot != nil {
+		if i < l.pendingSnapshot.Metadata.Index {
+			return 0, ErrCompacted
+		}
+		if i == l.pendingSnapshot.Metadata.Index {
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+	}
 	// There will be three situations that will cause the log entries to be empty:
 	// 1. A raft system is just init as start status(no snapshot and no storage)
 	// and all nodes are at term 0(None leader election happened).
 	// 2. A raft system is at term 1, but follower had not received log(even the noop entry).
 	// 3. All stabled entries are compacted.
+
 	if l.isEntriesEmpty() {
-		term, err := l.storage.Term(i)
-		return term, err
+		return l.storage.Term(i)
 	}
 	offset := l.entries[0].Index
 	if i > l.LastIndex() {
@@ -223,6 +233,16 @@ func (l *RaftLog) isEntriesEmpty() bool {
 func (l *RaftLog) append(ents ...pb.Entry) {
 	if len(ents) == 0 {
 		return
+	}
+	if l.pendingSnapshot != nil {
+		for len(ents) > 0 {
+			ent := ents[0]
+			if ent.Index <= l.pendingSnapshot.Metadata.Index {
+				ents = ents[1:]
+			} else {
+				break
+			}
+		}
 	}
 	l.entries = append(l.entries, ents...)
 }
@@ -265,6 +285,11 @@ func (l *RaftLog) tryMatch(i, t uint64) bool {
 	if i == 0 || t == 0 {
 		return true
 	}
+	if ps := l.pendingSnapshot; ps != nil {
+		if i == ps.Metadata.Index {
+			return t == ps.Metadata.Term
+		}
+	}
 	if i > l.LastIndex() {
 		return false
 	}
@@ -274,7 +299,8 @@ func (l *RaftLog) tryMatch(i, t uint64) bool {
 		// TODO: return false instead?
 		term, err := l.storage.Term(i)
 		if err != nil {
-			log.Panic(err)
+			// Compacted
+			return false
 		}
 		if t != term {
 			return false
@@ -288,7 +314,7 @@ func (l *RaftLog) tryMatch(i, t uint64) bool {
 	offset := l.entries[0].Index
 	// Match in storage
 	if i < offset {
-		term, err := l.storage.Term(i)
+		term, err := l.Term(i)
 		if err != nil {
 			log.Panic(err)
 		}
@@ -326,6 +352,22 @@ func (l *RaftLog) tryDeleteEntsAfterIndex(i uint64) {
 	l.entries = l.entries[0 : (i+1)-offset]
 }
 
+//tryDeleteEntsBeforeIndex will try to delete the entries which index <= i
+func (l *RaftLog) tryDeleteEntsBeforeIndex(i uint64) {
+	if l.isEntriesEmpty() {
+		return
+	}
+	if i >= l.LastIndex() {
+		l.entries = make([]pb.Entry, 0)
+		return
+	}
+	offset := l.entries[0].Index
+	if i < offset {
+		return
+	}
+	l.entries = l.entries[i-offset+1:]
+}
+
 // appliedTo update the applied to i, it will panic if i > committed or i < applied.
 func (l *RaftLog) appliedTo(i uint64) {
 	if i == 0 {
@@ -350,4 +392,16 @@ func (l *RaftLog) stableTo(i uint64) {
 		log.Panicf("Try stabled to %d, but oldStabled is %d", i, l.stabled)
 	}
 	l.stabled = i
+}
+
+// getSnapshot will return the pending snapshot or get snapshot from storage if the pending snapshot is nil
+func (l *RaftLog) getSnapshot() *pb.Snapshot {
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot
+	}
+	s, err := l.storage.Snapshot()
+	if err != nil {
+		return nil
+	}
+	return &s
 }

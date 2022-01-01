@@ -358,7 +358,36 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	metadata := snapshot.Metadata
+	// Update RaftLocalState, RaftApplyState
+	ps.raftState.LastIndex = metadata.Index
+	ps.raftState.LastTerm = metadata.Term
+	ps.applyState.AppliedIndex = metadata.Index
+	ps.applyState.TruncatedState.Index = metadata.Index
+	ps.applyState.TruncatedState.Term = metadata.Term
+	ps.snapState.StateType = snap.SnapState_Applying
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.GetId(),
+		Notifier: ch,
+		SnapMeta: metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	<-ch
+	result := &ApplySnapResult{
+		PrevRegion: ps.Region(),
+		Region:     snapData.Region,
+	}
+	// remove stale state from kvdb and raftdb
+	ps.clearMeta(kvWB, raftWB)
+	raftWB.SetMeta(meta.RaftStateKey(snapData.Region.GetId()), ps.raftState)
+	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState)
+	// TODO: check here in project3
+	// clear ExtraData
+	ps.clearExtraData(snapData.Region)
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	return result, nil
 }
 
 // Save memory states to disk.
@@ -368,10 +397,16 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Your Code Here (2B/2C).
 	// TODO: handle the snapshot
 	// Handle the entries that need stabled.
+	var applyRes *ApplySnapResult
+	var err error
 	raftWB := new(engine_util.WriteBatch)
-	if err := ps.Append(ready.Entries, raftWB); err != nil {
-		return nil, err
+	kvWB := new(engine_util.WriteBatch)
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		applyRes, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		kvWB.MustWriteToDB(ps.Engines.Kv)
 	}
+	// err returned by ps.Append always be nil
+	ps.Append(ready.Entries, raftWB)
 	// Update hard state
 	if ready.HardState.Term != 0 {
 		ps.raftState.HardState = &ready.HardState
@@ -379,10 +414,8 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Add the hard state in raftWB
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState)
 	// Write to Raft db
-	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
-		return nil, err
-	}
-	return nil, nil
+	raftWB.MustWriteToDB(ps.Engines.Raft)
+	return applyRes, err
 }
 
 func (ps *PeerStorage) ClearData() {
@@ -395,4 +428,17 @@ func (ps *PeerStorage) clearRange(regionID uint64, start, end []byte) {
 		StartKey: start,
 		EndKey:   end,
 	}
+}
+
+func max(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+func min(a, b uint64) uint64 {
+	if a > b {
+		return b
+	}
+	return a
 }

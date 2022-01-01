@@ -162,6 +162,9 @@ func (rn *RawNode) Ready() Ready {
 	if newHard := rn.Raft.hardState(); !isHardStateEqual(newHard, rn.prevHard) {
 		ready.HardState = newHard
 	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		ready.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
 	rn.acceptReady(ready)
 	return ready
 }
@@ -222,15 +225,20 @@ func (rd *Ready) appliedCursor() uint64 {
 		return rd.CommittedEntries[n-1].Index
 	}
 	// TODO: handle the snapshot in 2c
-	//if index := rd.Snapshot.Metadata.Index; index > 0 {
-	//	return index
-	//}
+	if !IsEmptySnap(&rd.Snapshot) {
+		if index := rd.Snapshot.Metadata.Index; index > 0 {
+			return index
+		}
+	}
 	return 0
 }
 
 func (rn *RawNode) acceptReady(rd Ready) {
 	if rd.SoftState != nil {
 		rn.prevSoft = rd.SoftState
+	}
+	if rd.Snapshot.Metadata != nil {
+		rn.Raft.RaftLog.pendingSnapshot = nil
 	}
 	rn.Raft.msgs = nil
 }

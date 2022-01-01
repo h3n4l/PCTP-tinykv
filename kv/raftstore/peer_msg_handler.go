@@ -7,6 +7,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/raft"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -53,9 +54,21 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	rd := d.RaftGroup.Ready()
 	//TODO: handle the snapshot
-	_, err := d.peerStorage.SaveReadyState(&rd)
+	applySnapRes, err := d.peerStorage.SaveReadyState(&rd)
 	if err != nil {
-		log.Panicf("Save Ready State Panic.")
+		log.Panic(err)
+	}
+	if applySnapRes != nil {
+		if !reflect.DeepEqual(applySnapRes.PrevRegion, applySnapRes.Region) {
+			// Update RegionLocalState
+			d.peerStorage.SetRegion(applySnapRes.Region)
+			storeMeta := d.ctx.storeMeta
+			storeMeta.Lock()
+			storeMeta.regions[applySnapRes.Region.Id] = applySnapRes.Region
+			storeMeta.regionRanges.Delete(&regionItem{region: applySnapRes.PrevRegion})
+			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapRes.Region})
+			storeMeta.Unlock()
+		}
 	}
 	//Send the msg
 	for _, msg := range rd.Messages {
@@ -96,6 +109,11 @@ func (d *peerMsgHandler) processNormalCommittedEntry(ent eraftpb.Entry) {
 	}
 	if cmdRequest.AdminRequest != nil {
 		// TODO: handle admin request
+		prop := d.handleProposal(ent.Index, ent.Term)
+		resp := d.appliedAdminRequest(cmdRequest.AdminRequest)
+		if prop != nil {
+			prop.cb.Done(resp)
+		}
 	} else if len(cmdRequest.Requests) != 0 {
 		d.appliedNormalRaftCmdRequest(cmdRequest.Requests)
 		prop := d.handleProposal(ent.Index, ent.Term)
@@ -104,6 +122,38 @@ func (d *peerMsgHandler) processNormalCommittedEntry(ent eraftpb.Entry) {
 			prop.cb.Done(resp)
 		}
 	}
+}
+
+func (d *peerMsgHandler) appliedAdminRequest(req *raft_cmdpb.AdminRequest) *raft_cmdpb.RaftCmdResponse {
+	resp := &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{
+			Error:       nil,
+			Uuid:        nil,
+			CurrentTerm: d.Term(),
+		},
+	}
+	switch req.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		compactReq := req.CompactLog
+		if compactReq.CompactIndex >= d.peerStorage.truncatedIndex() {
+			// notify to truncated
+			d.peerStorage.applyState.TruncatedState.Index = compactReq.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = compactReq.CompactTerm
+			// schedule a task to raftlog-gc worker
+			d.ScheduleCompactLog(compactReq.CompactIndex)
+			kvWB := new(engine_util.WriteBatch)
+			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+		} else {
+			d.ScheduleCompactLog(d.peerStorage.truncatedIndex())
+		}
+		resp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+			CompactLog: &raft_cmdpb.CompactLogResponse{},
+		}
+		return resp
+	}
+	return nil
 }
 
 // appliedNormalRaftCmdRequest applied the request in `reqs`
