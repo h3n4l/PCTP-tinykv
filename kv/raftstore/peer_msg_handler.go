@@ -375,7 +375,17 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		term:  d.Term(),
 		cb:    cb,
 	}
-	d.RaftGroup.Propose(data)
+	err = d.RaftGroup.Propose(data)
+	if err == raft.ErrInTransferLeader {
+		// return stalecommand
+		resp := &raft_cmdpb.RaftCmdResponse{
+			Header:        nil,
+			Responses:     nil,
+			AdminResponse: nil,
+		}
+		BindRespError(resp, &util.ErrStaleCommand{})
+		p.cb.Done(resp)
+	}
 	d.proposals = append(d.proposals, p)
 	log.Infof("Peer %d save a proposal %v", d.PeerId(), p)
 }
