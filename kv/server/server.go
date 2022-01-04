@@ -67,63 +67,52 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 
 func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	// Your Code Here (4B).
-	resp := &kvrpcpb.PrewriteResponse{
-		RegionError: nil,
-		Errors:      nil,
-	}
-	mutations := req.Mutations
+	resp := &kvrpcpb.PrewriteResponse{}
 	reader, _ := server.storage.Reader(req.Context)
 	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
-	for _, m := range mutations {
-		key := mvcc.EncodeKey(m.Key, req.StartVersion)
-		write, _, _ := txn.MostRecentWrite(key)
+
+	for _, m := range req.Mutations {
+		write, cTs, _ := txn.MostRecentWrite(m.Key)
 		if write != nil {
-			if write.StartTS > req.StartVersion {
+			//写冲突
+			if write.StartTS >= req.StartVersion {
 				wc := &kvrpcpb.WriteConflict{
-					StartTs:    write.StartTS,
-					ConflictTs: req.StartVersion,
+					StartTs:    req.StartVersion,
+					ConflictTs: cTs,
 					Key:        m.Key,
-					Primary:    nil,
+					Primary:    req.PrimaryLock,
 				}
-				ke := &kvrpcpb.KeyError{
-					Conflict: wc,
-				}
-				resp.Errors = append(resp.Errors, ke)
-				return resp, nil
+				resp.Errors = append(resp.Errors, &kvrpcpb.KeyError{Conflict: wc})
 			}
 		}
-		lock, _ := txn.GetLock(key)
-		if lock.Ts == req.StartVersion {
-			l := &kvrpcpb.LockInfo{
+		lock, _ := txn.GetLock(m.Key)
+		if lock != nil && lock.Ts == req.StartVersion {
+			li := &kvrpcpb.LockInfo{
 				PrimaryLock: lock.Primary,
 				LockVersion: lock.Ts,
 				Key:         m.Key,
 				LockTtl:     lock.Ttl,
 			}
-			ke := &kvrpcpb.KeyError{
-				Locked: l,
-			}
-			resp.Errors = append(resp.Errors, ke)
-			return resp, nil
+			resp.Errors = append(resp.Errors, &kvrpcpb.KeyError{Locked: li})
 		}
+		txn.PutValue(m.Key, m.Value)
 		l := &mvcc.Lock{
 			Primary: req.PrimaryLock,
 			Ts:      req.StartVersion,
 			Ttl:     req.LockTtl,
 			Kind:    mvcc.WriteKind(m.Op),
 		}
-		txn.PutLock(key, l)
-		w := &mvcc.Write{
-			StartTS: req.StartVersion,
-			Kind:    mvcc.WriteKindPut,
-		}
-		txn.PutWrite(key, req.StartVersion, w)
+		txn.PutLock(m.Key, l)
 		err := server.storage.Write(req.Context, txn.Writes())
 		if err != nil {
-			resp.RegionError = nil
+			if regionErr, ok := err.(*raft_storage.RegionError); ok {
+				resp.RegionError = regionErr.RequestErr
+				return resp, nil
+			}
 		}
+		return resp, nil
 	}
-	return resp, nil
+	return nil, nil
 }
 
 func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
