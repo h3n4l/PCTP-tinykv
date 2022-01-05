@@ -154,12 +154,11 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 	for _, k := range req.Keys {
 		lock, _ := txn.GetLock(k)
 		if lock == nil {
-			resp.Error = &kvrpcpb.KeyError{Abort: "txn failed"}
-			continue
+			return resp, nil
 		}
 		if lock.Ts != req.StartVersion {
-			resp.Error = &kvrpcpb.KeyError{Retryable: "retryable"}
-			continue
+			resp.Error = &kvrpcpb.KeyError{Retryable: "retry"}
+			return resp, nil
 		}
 		txn.DeleteLock(k)
 		w := &mvcc.Write{
@@ -187,42 +186,82 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 	// Your Code Here (4C).
 	resp := &kvrpcpb.CheckTxnStatusResponse{}
 	reader, _ := server.storage.Reader(req.Context)
-	txn := mvcc.NewMvccTxn(reader, req.CurrentTs)
+	//???? req.currentTs
+	txn := mvcc.NewMvccTxn(reader, req.LockTs)
 	key := req.PrimaryKey
 	write, cTs, _ := txn.CurrentWrite(key)
-	log.Println("write: ", write)
 	if write != nil {
 		if write.Kind != mvcc.WriteKindRollback {
 			resp.CommitVersion = cTs
 			resp.Action = kvrpcpb.Action_NoAction
+			return resp, nil
 		}
-	}
-	lock, _ := txn.GetLock(key)
-	log.Println("lock: ", lock)
-	if lock != nil || lock.Ttl > req.LockTs {
-		w := &mvcc.Write{
-			StartTS: req.CurrentTs,
-			Kind:    mvcc.WriteKindRollback,
-		}
-		resp.CommitVersion = cTs
-		resp.Action = kvrpcpb.Action_TTLExpireRollback
-		txn.PutWrite(key, req.CurrentTs, w)
-		txn.DeleteLock(key)
-	}
-	err := server.storage.Write(req.Context, txn.Writes())
-	if err != nil {
-		if regionErr, ok := err.(*raft_storage.RegionError); ok {
-			resp.RegionError = regionErr.RequestErr
-			resp.Action = kvrpcpb.Action_LockNotExistRollback
+		if write.Kind == mvcc.WriteKindRollback {
+			resp.Action = kvrpcpb.Action_NoAction
 			return resp, nil
 		}
 	}
+	lock, _ := txn.GetLock(key)
+	if lock == nil {
+		resp.Action = kvrpcpb.Action_LockNotExistRollback
+		w := &mvcc.Write{
+			StartTS: req.LockTs,
+			Kind:    mvcc.WriteKindRollback,
+		}
+		txn.PutWrite(key, req.LockTs, w)
+		err := server.storage.Write(req.Context, txn.Writes())
+		log.Println(err)
+		return resp, nil
+	}
+	if lock != nil {
+		if mvcc.PhysicalTime(req.CurrentTs) > mvcc.PhysicalTime(lock.Ts)+lock.Ttl {
+			resp.Action = kvrpcpb.Action_TTLExpireRollback
+			txn.DeleteValue(key)
+			txn.DeleteLock(key)
+			w := &mvcc.Write{
+				StartTS: req.LockTs,
+				Kind:    mvcc.WriteKindRollback,
+			}
+			txn.PutWrite(key, req.LockTs, w)
+			err := server.storage.Write(req.Context, txn.Writes())
+			log.Println(err)
+			return resp, nil
+		}
+		resp.Action = kvrpcpb.Action_NoAction
+		return resp, nil
+	}
+	resp.Action = kvrpcpb.Action_NoAction
+	resp.CommitVersion = resp.LockTtl
 	return resp, nil
 }
 
 func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := &kvrpcpb.BatchRollbackResponse{}
+	reader, _ := server.storage.Reader(req.Context)
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+	server.Latches.WaitForLatches(req.Keys)
+	defer server.Latches.ReleaseLatches(req.Keys)
+	log.Println("Keys: ", req.Keys)
+	for _, k := range req.Keys {
+		write, _, _ := txn.CurrentWrite(k)
+		if write != nil && write.Kind != mvcc.WriteKindRollback {
+			resp.Error = &kvrpcpb.KeyError{Abort: "txn aborted"}
+		}
+		if write.Kind == mvcc.WriteKindRollback {
+			return resp, nil
+		}
+		w := &mvcc.Write{
+			StartTS: req.StartVersion,
+			Kind:    mvcc.WriteKindRollback,
+		}
+		txn.PutWrite(k, req.StartVersion, w)
+		txn.DeleteLock(k)
+		txn.DeleteValue(k)
+	}
+	err := server.storage.Write(req.Context, txn.Writes())
+	log.Println(err)
+	return resp, nil
 }
 
 func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
