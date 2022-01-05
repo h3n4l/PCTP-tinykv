@@ -14,7 +14,7 @@ if [ $? -ne 0 ];then
     rm test_${projectName}_${i}.log
     rm -r /tmp/test-raftstore*
     echo "$(date +%Y-%m-%d\ %H:%M:%S) PASS ${i}/${times}"
-    sleep 3
+    sleep 1
 else
     echo "$(date +%Y-%m-%d\ %H:%M:%S) FAIL THIS TEST"
     fail=1

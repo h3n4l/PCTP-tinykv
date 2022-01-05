@@ -315,7 +315,9 @@ func (l *RaftLog) tryMatch(i, t uint64) bool {
 	// Match in storage
 	if i < offset {
 		term, err := l.Term(i)
-		if err != nil {
+		if err == ErrCompacted {
+			return true
+		}else if err != nil{
 			log.Panic(err)
 		}
 		if t != term {

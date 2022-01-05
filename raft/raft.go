@@ -300,6 +300,7 @@ func (r *Raft) sendSnapshot(to uint64) {
 		return
 	}
 	snapshotMsg.Snapshot = s
+	log.Infof("Raft:%d send snapshot to %d", r.id, to)
 	r.msgs = append(r.msgs, snapshotMsg)
 }
 
@@ -534,7 +535,7 @@ func (r *Raft) Step(m pb.Message) error {
 				return ErrInTransferLeader
 			}
 			for _, ent := range m.Entries {
-				log.Infof("Peer %d receive a propose, index is %d, data is : %v", r.id, r.RaftLog.LastIndex()+1, ent.Data)
+				//log.Infof("Peer %d receive a propose, index is %d, data is : %v", r.id, r.RaftLog.LastIndex()+1, ent.Data)
 				r.appendEntry(*ent)
 			}
 			if r.nPeers() == 1 {
@@ -617,9 +618,20 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 	// Try to match the prevIndex and prevTerm
 	if match := r.RaftLog.tryMatch(m.Index, m.LogTerm); !match {
-		log.Infof("Raft %d try match (%d,%d), but false, so reject.", r.id, m.Index, m.LogTerm)
+		//log.Infof("Raft %d try match (%d,%d), but false, so reject.", r.id, m.Index, m.LogTerm)
 		// Reject if log don't match, resp.Index and resp.Term are same as the m
 		appendResp.Reject = true
+		// Quick Match, return the first Index of corresponding Term
+		if len(r.RaftLog.entries) != 0 {
+			for i := 0; i < len(r.RaftLog.entries); i++ {
+				if r.RaftLog.entries[i].Term == m.Term {
+					appendResp.Entries = []*pb.Entry{
+						&(r.RaftLog.entries[i]),
+					}
+				}
+				break
+			}
+		}
 		return
 	}
 	// append the entry in my log
@@ -637,7 +649,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		}
 	}
 	if len(m.Entries) != 0 {
-		log.Infof("Raft %d receive log from peer %d range [%d,%d]", r.id, m.From, m.Entries[0].Index, m.Entries[len(m.Entries)-1].Index)
+		// log.Infof("Raft %d receive log from peer %d range [%d,%d]", r.id, m.From, m.Entries[0].Index, m.Entries[len(m.Entries)-1].Index)
 	}
 	for _, entp := range m.Entries {
 		lastNewEntryIndex = entp.Index
@@ -661,6 +673,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	appendResp.Index = lastNewEntryIndex
 	t, _ := r.RaftLog.Term(appendResp.Index)
 	appendResp.LogTerm = t
+	r.resetElectionElapsed()
 	return
 }
 
@@ -674,7 +687,22 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	}
 	// If m.From reject append RPC because of don't match the prevLog, decrease the r.Prs[to].Next
 	if m.Reject && m.Index == r.Prs[m.From].Next-1 {
-		r.Prs[m.From].Next -= 1
+		// Find the first index of return term
+		if len(m.Entries) != 0 {
+			ent := m.Entries[0]
+			for i := 0; i < len(r.RaftLog.entries); i++ {
+				if ent.Term == r.RaftLog.entries[i].Term {
+					if r.Prs[m.From].Next != r.RaftLog.entries[i].Index {
+						r.Prs[m.From].Next = r.RaftLog.entries[i].Index
+					}else {
+						r.Prs[m.From].Next--
+					}
+					break
+				}
+			}
+		} else {
+			r.Prs[m.From].Next -= 1
+		}
 		// if reject, need send again with new next
 		r.sendAppend(m.From)
 		return
@@ -851,6 +879,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 	}
 	meta := m.Snapshot.Metadata
+	log.Infof("Raft %d receive snapshot from %d, meta: %d,%d", r.id, m.From, meta.Index, meta.Term)
 	resp := pb.Message{
 		MsgType:  pb.MessageType_MsgAppendResponse,
 		To:       m.From,
@@ -884,6 +913,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		// Clean all log
 		r.RaftLog.entries = make([]pb.Entry, 0)
 	}
+	//log.Infof("Raft %d receive snapshot from %d", r.id, m.From)
 	// pending it
 	r.RaftLog.pendingSnapshot = m.Snapshot
 	// update some status
@@ -901,8 +931,18 @@ func (r *Raft) addNode(id uint64) {
 	if _, ok := r.Prs[id]; !ok {
 		r.Prs[id] = &Progress{
 			Match: 0,
-			Next:  1,
+			Next:  2,
 		}
+		log.Infof("Raft %d add node %d, now node list: %v", r.id, id, func() []uint64 {
+			res := make(uint64Slice, 0)
+			for pid := range r.Prs {
+				res = append(res, pid)
+			}
+			sort.Sort(res)
+			return res
+		}())
+		r.votes[id] = false
+		r.hadVotes[id] = false
 	}
 	r.PendingConfIndex = None
 }
@@ -912,6 +952,16 @@ func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
 	if _, ok := r.Prs[id]; ok {
 		delete(r.Prs, id)
+		delete(r.votes, id)
+		delete(r.hadVotes, id)
+		log.Infof("Raft %d remove node %d, now node list: %v", r.id, id, func() []uint64 {
+			res := make(uint64Slice, 0)
+			for pid := range r.Prs {
+				res = append(res, pid)
+			}
+			sort.Sort(res)
+			return res
+		}())
 		if r.State == StateLeader {
 			// Try to update commit
 			match := make(uint64Slice, len(r.Prs))
@@ -1166,6 +1216,7 @@ func (r *Raft) handleTimeoutNow(m pb.Message) {
 	if match := r.RaftLog.tryMatch(m.Index, m.LogTerm); match {
 		r.Step(r.newMsgHup())
 	}
+	r.leadTransferee = None
 }
 
 func (r *Raft) checkIdInRaftGroup(id uint64) bool {
