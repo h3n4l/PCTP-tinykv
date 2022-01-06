@@ -22,6 +22,8 @@ import (
 type Latches struct {
 	// Before modifying any property of a key, the thread must have the latch for that key. `Latches` maps each latched
 	// key to a WaitGroup. Threads who find a key locked should wait on that WaitGroup.
+	// 在修改key的任何属性之前 该线程必须持有key的闩锁
+	// waitGroup是由每一个需要被锁定的key组成 发现Key被锁定的线程应该等待该该WaitGruop
 	latchMap map[string]*sync.WaitGroup
 	// Mutex to guard latchMap. A thread must hold this mutex while it makes any change to latchMap.
 	latchGuard sync.Mutex

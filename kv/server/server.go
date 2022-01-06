@@ -286,7 +286,8 @@ func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockR
 		value, _ := item.Value()
 		lock, _ := mvcc.ParseLock(value)
 		if lock.Ts == req.StartVersion {
-			mutations = append(mutations, lock.Primary)
+			key := item.KeyCopy(nil)
+			mutations = append(mutations, key)
 		}
 		it.Next()
 	}
