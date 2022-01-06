@@ -126,6 +126,9 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 	originStoreInfo = stores[i]
 
 	storeIds := regionInfo.GetStoreIds()
+	if len(storeIds) < cluster.GetMaxReplicas() {
+		return nil
+	}
 	for k := 0; k < i; k++ {
 		if _, ok := storeIds[stores[k].GetID()]; !ok {
 			destStoreInfo = stores[k]
