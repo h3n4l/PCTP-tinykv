@@ -186,7 +186,6 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 	// Your Code Here (4C).
 	resp := &kvrpcpb.CheckTxnStatusResponse{}
 	reader, _ := server.storage.Reader(req.Context)
-	//???? req.currentTs
 	txn := mvcc.NewMvccTxn(reader, req.LockTs)
 	key := req.PrimaryKey
 	write, cTs, _ := txn.CurrentWrite(key)
@@ -247,8 +246,20 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 		write, _, _ := txn.CurrentWrite(k)
 		if write != nil && write.Kind != mvcc.WriteKindRollback {
 			resp.Error = &kvrpcpb.KeyError{Abort: "txn aborted"}
+			return resp, nil
 		}
-		if write.Kind == mvcc.WriteKindRollback {
+		if write != nil && write.Kind == mvcc.WriteKindRollback {
+			return resp, nil
+		}
+		lock, _ := txn.GetLock(k)
+		if lock != nil && lock.Ts != req.StartVersion {
+			w := &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			}
+			txn.PutWrite(k, req.StartVersion, w)
+			err := server.storage.Write(req.Context, txn.Writes())
+			log.Println(err)
 			return resp, nil
 		}
 		w := &mvcc.Write{
@@ -266,7 +277,45 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 
 func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := &kvrpcpb.ResolveLockResponse{}
+	reader, _ := server.storage.Reader(req.Context)
+	it := reader.IterCF("lock")
+	var mutations [][]byte
+	for it.Valid() {
+		item := it.Item()
+		value, _ := item.Value()
+		lock, _ := mvcc.ParseLock(value)
+		if lock.Ts == req.StartVersion {
+			mutations = append(mutations, lock.Primary)
+		}
+		it.Next()
+	}
+	if len(mutations) > 0 {
+		if req.CommitVersion == 0 {
+			request := &kvrpcpb.BatchRollbackRequest{
+				Context:      req.Context,
+				StartVersion: req.StartVersion,
+				Keys:         mutations,
+			}
+			rollback, err := server.KvBatchRollback(nil, request)
+			resp.RegionError = rollback.RegionError
+			resp.Error = rollback.Error
+			return resp, err
+
+		} else {
+			request := &kvrpcpb.CommitRequest{
+				Context:       req.Context,
+				StartVersion:  req.StartVersion,
+				Keys:          mutations,
+				CommitVersion: req.CommitVersion,
+			}
+			commit, err := server.KvCommit(nil, request)
+			resp.RegionError = commit.RegionError
+			resp.Error = commit.Error
+			return resp, err
+		}
+	}
+	return resp, nil
 }
 
 // SQL push down commands.
