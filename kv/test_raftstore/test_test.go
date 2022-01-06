@@ -644,6 +644,7 @@ func TestConfChangeSnapshotUnreliableRecoverConcurrentPartition3B(t *testing.T) 
 
 func TestOneSplit3B(t *testing.T) {
 	cfg := config.NewTestConfig()
+	log.Errorf("%v",cfg)
 	cfg.RegionMaxSize = 800
 	cfg.RegionSplitSize = 500
 	cluster := NewTestCluster(5, cfg)

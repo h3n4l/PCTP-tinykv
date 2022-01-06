@@ -787,6 +787,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		}
 	}
 	r.msgs = append(r.msgs, resp)
+	r.resetHeartbeatElapsed()
 	return
 }
 
@@ -923,6 +924,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	for _, id := range meta.ConfState.Nodes {
 		r.Prs[id] = &Progress{}
 	}
+	r.resetElectionElapsed()
 }
 
 // addNode add a new node to raft group
