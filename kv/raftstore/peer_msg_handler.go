@@ -208,9 +208,6 @@ func (d *peerMsgHandler) processConfChangeEntry(ent eraftpb.Entry) {
 			},
 		})
 	}
-	if d.IsLeader() {
-		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
-	}
 }
 
 // processNormalCommittedEntry will handle the committed entry, included response, apply...
@@ -223,7 +220,7 @@ func (d *peerMsgHandler) processNormalCommittedEntry(ent eraftpb.Entry) {
 		d.peerStorage.applyState.AppliedIndex += 1
 		kvWB.SetMeta(meta.ApplyStateKey(d.Region().GetId()), d.peerStorage.applyState)
 		kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-		if prop!=nil{
+		if prop != nil {
 			prop.cb.Done(ErrRespStaleCommand(d.Term()))
 		}
 		return
@@ -265,9 +262,9 @@ func (d *peerMsgHandler) processNormalCommittedEntry(ent eraftpb.Entry) {
 		// TODO: handle admin request
 		d.appliedAdminRequest(&cmdRequest, prop)
 	} else if len(cmdRequest.Requests) != 0 {
-		hadresped := d.appliedNormalRaftCmdRequest(cmdRequest.Requests,prop)
+		hadresped := d.appliedNormalRaftCmdRequest(cmdRequest.Requests, prop)
 		if prop != nil && !hadresped {
-			resp := d.getResponseOfNormalRaftCmdRequest(cmdRequest.Requests, prop,cmdRequest.Header.RegionEpoch)
+			resp := d.getResponseOfNormalRaftCmdRequest(cmdRequest.Requests, prop, cmdRequest.Header.RegionEpoch)
 			prop.cb.Done(resp)
 		}
 	}
@@ -307,6 +304,14 @@ func (d *peerMsgHandler) appliedAdminRequest(req *raft_cmdpb.RaftCmdRequest, pro
 	case raft_cmdpb.AdminCmdType_Split:
 		splitReq := req.AdminRequest.Split
 		region := d.Region()
+		// check region not found
+		if req.Header.RegionId != d.regionId {
+			spResp := &util.ErrRegionNotFound{RegionId: req.Header.RegionId}
+			if prop != nil {
+				prop.cb.Done(ErrResp(spResp))
+			}
+			return
+		}
 		// check region epoch
 		err := util.CheckRegionEpoch(req, region, true)
 		if errEpochNotMatch, ok := err.(*util.ErrEpochNotMatch); ok {
@@ -370,6 +375,7 @@ func (d *peerMsgHandler) appliedAdminRequest(req *raft_cmdpb.RaftCmdRequest, pro
 		// Register in router
 		d.ctx.router.register(peer)
 		d.ctx.router.send(newRegion.Id, message.Msg{
+			RegionID: newRegion.Id,
 			Type:     message.MsgTypeStart,
 		})
 		if prop != nil {
@@ -381,14 +387,12 @@ func (d *peerMsgHandler) appliedAdminRequest(req *raft_cmdpb.RaftCmdRequest, pro
 			}
 			prop.cb.Done(resp)
 		}
-		if d.IsLeader() {
-			d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
-		}
+		//d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 	}
 }
 
 // appliedNormalRaftCmdRequest applied the request in `reqs`
-func (d *peerMsgHandler) appliedNormalRaftCmdRequest(reqs []*raft_cmdpb.Request,prop *proposal) (hadResponed bool) {
+func (d *peerMsgHandler) appliedNormalRaftCmdRequest(reqs []*raft_cmdpb.Request, prop *proposal) (hadResponed bool) {
 	if len(reqs) != 1 {
 		log.Panicf("many reqs")
 	}
@@ -401,10 +405,10 @@ func (d *peerMsgHandler) appliedNormalRaftCmdRequest(reqs []*raft_cmdpb.Request,
 	kvWB := new(engine_util.WriteBatch)
 	req := reqs[0]
 	key := getRequestKey(req)
-	if key != nil{
-		keyErr := util.CheckKeyInRegion(key,d.Region())
-		if keyErr != nil{
-			if prop != nil{
+	if key != nil {
+		keyErr := util.CheckKeyInRegion(key, d.Region())
+		if keyErr != nil {
+			if prop != nil {
 				d.peerStorage.applyState.AppliedIndex += 1
 				kvWB.SetMeta(meta.ApplyStateKey(d.Region().GetId()), d.peerStorage.applyState)
 				kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
@@ -422,7 +426,7 @@ func (d *peerMsgHandler) appliedNormalRaftCmdRequest(reqs []*raft_cmdpb.Request,
 	case raft_cmdpb.CmdType_Delete:
 		kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
 	case raft_cmdpb.CmdType_Snap:
-		
+
 	}
 	// Update the applied index
 	d.peerStorage.applyState.AppliedIndex += 1
@@ -433,7 +437,7 @@ func (d *peerMsgHandler) appliedNormalRaftCmdRequest(reqs []*raft_cmdpb.Request,
 
 // getResponseOfNormalRaftCmdRequest will return the response of request and proposal, caller need protect
 // reqs are not nil and prop is not nil
-func (d *peerMsgHandler) getResponseOfNormalRaftCmdRequest(reqs []*raft_cmdpb.Request, prop *proposal,re *metapb.RegionEpoch) *raft_cmdpb.RaftCmdResponse {
+func (d *peerMsgHandler) getResponseOfNormalRaftCmdRequest(reqs []*raft_cmdpb.Request, prop *proposal, re *metapb.RegionEpoch) *raft_cmdpb.RaftCmdResponse {
 	if len(reqs) != 1 {
 		log.Panicf("many reqs")
 	}
@@ -469,7 +473,7 @@ func (d *peerMsgHandler) getResponseOfNormalRaftCmdRequest(reqs []*raft_cmdpb.Re
 			CmdType: raft_cmdpb.CmdType_Delete,
 		}}
 	case raft_cmdpb.CmdType_Snap:
-		if re.Version != d.Region().RegionEpoch.Version{
+		if re.Version != d.Region().RegionEpoch.Version {
 			return ErrResp(&util.ErrEpochNotMatch{})
 		}
 		cmdResp.Responses = []*raft_cmdpb.Response{{

@@ -56,7 +56,7 @@ func (c *Cluster) Start() {
 
 	for storeID := uint64(1); storeID <= uint64(c.count); storeID++ {
 		dbPath, err := ioutil.TempDir("", "test-raftstore")
-		log.Errorf("%v",dbPath)
+		log.Errorf("%v", dbPath)
 		if err != nil {
 			panic(err)
 		}

@@ -220,6 +220,10 @@ func newRaft(c *Config) *Raft {
 			Next:  0,
 		}
 	}
+	r.Prs[r.id] = &Progress{
+		Match: 0,
+		Next:  0,
+	}
 	if !IsEmptyHardState(hs) {
 		r.loadState(hs)
 	}
@@ -694,7 +698,7 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 				if ent.Term == r.RaftLog.entries[i].Term {
 					if r.Prs[m.From].Next != r.RaftLog.entries[i].Index {
 						r.Prs[m.From].Next = r.RaftLog.entries[i].Index
-					}else {
+					} else {
 						r.Prs[m.From].Next--
 					}
 					break
