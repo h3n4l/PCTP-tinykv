@@ -656,7 +656,7 @@ func TestOneSplit3B(t *testing.T) {
 	region := cluster.GetRegion([]byte("k1"))
 	region1 := cluster.GetRegion([]byte("k2"))
 	assert.Equal(t, region.GetId(), region1.GetId())
-
+	// isolation peer 5
 	cluster.AddFilter(
 		&PartitionFilter{
 			s1: []uint64{1, 2, 3, 4},

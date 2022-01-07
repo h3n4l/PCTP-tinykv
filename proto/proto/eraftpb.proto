@@ -32,6 +32,8 @@ message SnapshotMetadata {
 }
 
 message Snapshot {
+    // the data field on eraftpb.Snapshot does not represent the actual state machine data,
+    // but some metadata is used by the upper application which you can ignore for now
     bytes data = 1;
     SnapshotMetadata metadata = 2;
 }

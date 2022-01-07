@@ -5,3 +5,6 @@ unikv/unikv
 bin/*
 _tools
 /vendor
+
+# result.log will never be add, it only appears when you save test result.
+test2b.log

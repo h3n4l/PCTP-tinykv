@@ -209,6 +209,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 	startTime := time.Now()
 	regionID := request.Header.RegionId
 	leader := c.LeaderOfRegion(regionID)
+	log.Infof("Leader of [Region %d] is %d", regionID, leader.GetId())
 	for {
 		if time.Now().Sub(startTime) > timeout {
 			return nil, nil
@@ -236,6 +237,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 			continue
 		}
 		if resp.Header.Error != nil {
+			//log.Infof("CallCommandOnLeader: receive resp: %v", resp)
 			err := resp.Header.Error
 			if err.GetStaleCommand() != nil || err.GetEpochNotMatch() != nil || err.GetNotLeader() != nil {
 				log.Debugf("encouter retryable err %+v", resp)
