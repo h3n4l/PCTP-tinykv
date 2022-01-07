@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/codec"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/tsoutil"
 )
@@ -46,7 +47,7 @@ func (txn *MvccTxn) PutWrite(key []byte, ts uint64, write *Write) {
 		Data: storage.Put{
 			Key:   encodeKey,
 			Value: write.ToBytes(),
-			Cf:    "write",
+			Cf:    engine_util.CfWrite,
 		},
 	}
 	txn.writes = append(txn.writes, w)
@@ -56,7 +57,7 @@ func (txn *MvccTxn) PutWrite(key []byte, ts uint64, write *Write) {
 // if an error occurs during lookup.
 func (txn *MvccTxn) GetLock(key []byte) (*Lock, error) {
 	// Your Code Here (4A).
-	it := txn.Reader.IterCF("lock")
+	it := txn.Reader.IterCF(engine_util.CfLock)
 	for it.Valid() {
 		item := it.Item()
 		if isSameKey(item.Key(), key) {
@@ -82,7 +83,7 @@ func (txn *MvccTxn) PutLock(key []byte, lock *Lock) {
 		Data: storage.Put{
 			Key:   key,
 			Value: lock.ToBytes(),
-			Cf:    "lock",
+			Cf:    engine_util.CfLock,
 		},
 	}
 	txn.writes = append(txn.writes, w)
@@ -94,7 +95,7 @@ func (txn *MvccTxn) DeleteLock(key []byte) {
 	w := storage.Modify{
 		Data: storage.Delete{
 			Key: key,
-			Cf:  "lock",
+			Cf:  engine_util.CfLock,
 		},
 	}
 	txn.writes = append(txn.writes, w)
@@ -104,7 +105,7 @@ func (txn *MvccTxn) DeleteLock(key []byte) {
 // I.e., the most recent value committed before the start of this transaction.
 func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 	// Your Code Here (4A).
-	it := txn.Reader.IterCF("write")
+	it := txn.Reader.IterCF(engine_util.CfWrite)
 	for it.Valid() {
 		item := it.Item()
 		userKey := DecodeUserKey(item.Key())
@@ -127,7 +128,7 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 			}
 			if write.StartTS < txn.StartTS {
 				e := EncodeKey(key, write.StartTS)
-				v, rErr := txn.Reader.GetCF("default", e)
+				v, rErr := txn.Reader.GetCF(engine_util.CfDefault, e)
 				if rErr != nil {
 					return nil, rErr
 				}
@@ -149,7 +150,7 @@ func (txn *MvccTxn) PutValue(key []byte, value []byte) {
 		Data: storage.Put{
 			Key:   encodeKey,
 			Value: value,
-			Cf:    "default",
+			Cf:    engine_util.CfDefault,
 		},
 	}
 	txn.writes = append(txn.writes, w)
@@ -164,7 +165,7 @@ func (txn *MvccTxn) DeleteValue(key []byte) {
 	w := storage.Modify{
 		Data: storage.Delete{
 			Key: encodedKey,
-			Cf:  "default",
+			Cf:  engine_util.CfDefault,
 		},
 	}
 
@@ -175,7 +176,7 @@ func (txn *MvccTxn) DeleteValue(key []byte) {
 // write's commit timestamp, or an error.
 func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 	//Your Code Here (4A).
-	it := txn.Reader.IterCF("write")
+	it := txn.Reader.IterCF(engine_util.CfWrite)
 	for it.Valid() {
 		item := it.Item()
 		userKey := DecodeUserKey(item.Key())
@@ -202,7 +203,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 // write's commit timestamp, or an error.
 func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 	// Your Code Here (4A).
-	it := txn.Reader.IterCF("write")
+	it := txn.Reader.IterCF(engine_util.CfWrite)
 	for it.Valid() {
 		item := it.Item()
 		userKey := DecodeUserKey(item.Key())

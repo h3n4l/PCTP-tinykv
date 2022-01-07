@@ -10,19 +10,18 @@ import (
 // Invariant: either the scanner is finished and cannot be used, or it is ready to return a value immediately.
 type Scanner struct {
 	// Your Data Here (4C).
-	nextKey  []byte
-	txn      *MvccTxn
-	iter     engine_util.DBIterator
-	finished bool
+	next []byte
+	txn  *MvccTxn
+	iter engine_util.DBIterator
 }
 
 // NewScanner creates a new scanner ready to read from the snapshot in txn.
 func NewScanner(startKey []byte, txn *MvccTxn) *Scanner {
 	// Your Code Here (4C).
 	return &Scanner{
-		nextKey: startKey,
-		txn:     txn,
-		iter:    txn.Reader.IterCF(engine_util.CfWrite),
+		next: startKey,
+		txn:  txn,
+		iter: txn.Reader.IterCF(engine_util.CfWrite),
 	}
 }
 
@@ -34,47 +33,49 @@ func (scan *Scanner) Close() {
 // Next returns the next key/value pair from the scanner. If the scanner is exhausted, then it will return `nil, nil, nil`.
 func (scan *Scanner) Next() ([]byte, []byte, error) {
 	// Your Code Here (4C).
-	if scan.finished {
+	if scan.next == nil {
 		return nil, nil, nil
 	}
-	key := scan.nextKey
+	key := scan.next
 	scan.iter.Seek(EncodeKey(key, scan.txn.StartTS))
 	if !scan.iter.Valid() {
-		scan.finished = true
+		scan.next = nil
 		return nil, nil, nil
 	}
 	item := scan.iter.Item()
-	gotKey := item.KeyCopy(nil)
-	userKey := DecodeUserKey(gotKey)
-	if !bytes.Equal(key, userKey) {
-		scan.nextKey = userKey
-		return scan.Next()
+	userKey := DecodeUserKey(item.Key())
+	currentTs := decodeTimestamp(item.Key())
+	for scan.iter.Valid() && currentTs > scan.txn.StartTS {
+		scan.iter.Seek(EncodeKey(userKey, scan.txn.StartTS))
+		item = scan.iter.Item()
+		currentTs = decodeTimestamp(item.Key())
+		userKey = DecodeUserKey(item.Key())
 	}
-	for {
-		scan.iter.Next()
-		if !scan.iter.Valid() {
-			scan.finished = true
+	if !scan.iter.Valid() {
+		scan.next = nil
+		return nil, nil, nil
+	}
+	for ; scan.iter.Valid(); scan.iter.Next() {
+		nextUserKey := DecodeUserKey(scan.iter.Item().Key())
+		if !bytes.Equal(nextUserKey, userKey) {
+			scan.next = nextUserKey
 			break
 		}
-		item := scan.iter.Item()
-		gotKey := item.KeyCopy(nil)
-		userKey := DecodeUserKey(gotKey)
-		if !bytes.Equal(key, userKey) {
-			scan.nextKey = userKey
-			break
-		}
 	}
-	writeVal, err := item.ValueCopy(nil)
+	if !scan.iter.Valid() {
+		scan.next = nil
+	}
+	value, err := item.Value()
 	if err != nil {
-		return key, nil, err
+		return userKey, nil, err
 	}
-	write, err := ParseWrite(writeVal)
+	write, err := ParseWrite(value)
 	if err != nil {
-		return key, nil, err
+		return userKey, nil, err
 	}
-	if write.Kind == WriteKindDelete {
-		return key, nil, nil
+	if write.Kind != WriteKindPut {
+		return userKey, nil, nil
 	}
-	value, err := scan.txn.Reader.GetCF(engine_util.CfDefault, EncodeKey(key, write.StartTS))
-	return key, value, err
+	v, err := scan.txn.Reader.GetCF(engine_util.CfDefault, EncodeKey(userKey, write.StartTS))
+	return userKey, v, err
 }

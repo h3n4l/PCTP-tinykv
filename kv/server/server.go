@@ -11,7 +11,6 @@ import (
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/tinykvpb"
 	"github.com/pingcap/tidb/kv"
-	"log"
 )
 
 var _ tinykvpb.TinyKvServer = new(Server)
@@ -177,62 +176,51 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
 	// Your Code Here (4C).
-	resp := &kvrpcpb.ScanResponse{}
+	rsp := &kvrpcpb.ScanResponse{}
 	reader, err := server.storage.Reader(req.Context)
 	if err != nil {
 		if regionErr, ok := err.(*raft_storage.RegionError); ok {
-			resp.RegionError = regionErr.RequestErr
-			return resp, nil
+			rsp.RegionError = regionErr.RequestErr
+			return rsp, nil
 		}
 		return nil, err
 	}
-	defer reader.Close()
 	txn := mvcc.NewMvccTxn(reader, req.Version)
 	scanner := mvcc.NewScanner(req.StartKey, txn)
 	defer scanner.Close()
-	var pairs []*kvrpcpb.KvPair
-	limit := int(req.Limit)
-	for i := 0; i < limit; {
-		key, value, err := scanner.Next()
-		if err != nil {
-			if regionErr, ok := err.(*raft_storage.RegionError); ok {
-				resp.RegionError = regionErr.RequestErr
-				return resp, nil
-			}
-			return nil, err
-		}
-		if key == nil {
+	kvs := make([]*kvrpcpb.KvPair, 0)
+	for i := uint32(0); i < req.Limit; {
+		key, value, sErr := scanner.Next()
+		if key == nil && value == nil && sErr == nil {
 			break
 		}
-		lock, err := txn.GetLock(key)
 		if err != nil {
 			if regionErr, ok := err.(*raft_storage.RegionError); ok {
-				resp.RegionError = regionErr.RequestErr
-				return resp, nil
+				rsp.RegionError = regionErr.RequestErr
+				return rsp, nil
 			}
 			return nil, err
 		}
+		lock, _ := txn.GetLock(key)
 		if lock != nil && req.Version >= lock.Ts {
-			pairs = append(pairs, &kvrpcpb.KvPair{
+			kvs = append(kvs, &kvrpcpb.KvPair{
 				Error: &kvrpcpb.KeyError{
 					Locked: &kvrpcpb.LockInfo{
 						PrimaryLock: lock.Primary,
 						LockVersion: lock.Ts,
 						Key:         key,
 						LockTtl:     lock.Ttl,
-					}},
-				Key: key,
+					},
+				},
 			})
 			i++
-			continue
-		}
-		if value != nil {
-			pairs = append(pairs, &kvrpcpb.KvPair{Key: key, Value: value})
+		} else if value != nil {
+			kvs = append(kvs, &kvrpcpb.KvPair{Key: key, Value: value})
 			i++
 		}
 	}
-	resp.Pairs = pairs
-	return resp, nil
+	rsp.Pairs = kvs
+	return rsp, nil
 }
 
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
@@ -262,7 +250,12 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 		}
 		txn.PutWrite(key, req.LockTs, w)
 		err := server.storage.Write(req.Context, txn.Writes())
-		log.Println(err)
+		if err != nil {
+			if regionErr, ok := err.(*raft_storage.RegionError); ok {
+				resp.RegionError = regionErr.RequestErr
+				return resp, nil
+			}
+		}
 		return resp, nil
 	}
 	if lock != nil {
@@ -276,7 +269,12 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 			}
 			txn.PutWrite(key, req.LockTs, w)
 			err := server.storage.Write(req.Context, txn.Writes())
-			log.Println(err)
+			if err != nil {
+				if regionErr, ok := err.(*raft_storage.RegionError); ok {
+					resp.RegionError = regionErr.RequestErr
+					return resp, nil
+				}
+			}
 			return resp, nil
 		}
 		resp.Action = kvrpcpb.Action_NoAction
@@ -311,7 +309,12 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 			}
 			txn.PutWrite(k, req.StartVersion, w)
 			err := server.storage.Write(req.Context, txn.Writes())
-			log.Println(err)
+			if err != nil {
+				if regionErr, ok := err.(*raft_storage.RegionError); ok {
+					resp.RegionError = regionErr.RequestErr
+					return resp, nil
+				}
+			}
 			return resp, nil
 		}
 		w := &mvcc.Write{
