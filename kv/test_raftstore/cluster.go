@@ -195,6 +195,7 @@ func (c *Cluster) Request(key []byte, reqs []*raft_cmdpb.Request, timeout time.D
 			SleepMS(100)
 			continue
 		}
+		log.Infof("%s in region %v",key,region)
 		return resp, txn
 	}
 	panic("request timeout")
@@ -372,6 +373,7 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 			panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Snap")
 		}
 		region := resp.Responses[0].GetSnap().Region
+		log.Infof("Scan get snap : %v,region: %v", resp, region)
 		iter := raft_storage.NewRegionReader(txn, *region).IterCF(engine_util.CfDefault)
 		for iter.Seek(key); iter.Valid(); iter.Next() {
 			if engine_util.ExceedEndKey(iter.Item().Key(), end) {

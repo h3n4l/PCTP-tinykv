@@ -385,10 +385,10 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		PrevRegion: ps.Region(),
 		Region:     snapData.Region,
 	}
-	ps.snapState.StateType = snap.SnapState_Relax
+	//ps.snapState.StateType = snap.SnapState_Relax
 	// remove stale state from kvdb and raftdb
 	ps.clearMeta(kvWB, raftWB)
-	//raftWB.SetMeta(meta.RaftStateKey(snapData.Region.GetId()), ps.raftState)
+	raftWB.SetMeta(meta.RaftStateKey(snapData.Region.GetId()), ps.raftState)
 	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState)
 	// TODO: check here in project3
 	// clear ExtraData

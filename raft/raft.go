@@ -165,6 +165,8 @@ type Raft struct {
 	// Add in 2aa:
 	// To record if the follower votes in this term
 	hadVotes map[uint64]bool
+
+	pendingElectionElapsed int
 }
 
 // newRaft return a raft peer with the given config
@@ -361,7 +363,11 @@ func (r *Raft) tick() {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
-		r.electionElapsed += 1
+		if r.pendingElectionElapsed < 0 {
+			r.pendingElectionElapsed++
+		} else {
+			r.electionElapsed += 1
+		}
 		// check the electionElapsed
 		if r.electionElapsed >= r.electionTimeout {
 			// If this peer had not received the heartbeat during the r.electionTimeout,
@@ -371,7 +377,11 @@ func (r *Raft) tick() {
 			r.Step(localHupMsg)
 		}
 	case StateCandidate:
-		r.electionElapsed += 1
+		if r.pendingElectionElapsed < 0 {
+			r.pendingElectionElapsed++
+		} else {
+			r.electionElapsed += 1
+		}
 		if r.electionElapsed >= r.electionTimeout {
 			// ElectionTimeout, start a new election
 			// Transfer to a StateCandidate to request votes in the cluster.
@@ -618,20 +628,20 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 	// Try to match the prevIndex and prevTerm
 	if match := r.RaftLog.tryMatch(m.Index, m.LogTerm); !match {
-		//log.Infof("Raft %d try match (%d,%d), but false, so reject.", r.id, m.Index, m.LogTerm)
+		log.Infof("Raft %d try match (%d,%d), but false, so reject.", r.id, m.Index, m.LogTerm)
 		// Reject if log don't match, resp.Index and resp.Term are same as the m
 		appendResp.Reject = true
 		// Quick Match, return the first Index of corresponding Term
-		if len(r.RaftLog.entries) != 0 {
-			for i := 0; i < len(r.RaftLog.entries); i++ {
-				if r.RaftLog.entries[i].Term == m.Term {
-					appendResp.Entries = []*pb.Entry{
-						&(r.RaftLog.entries[i]),
-					}
-				}
-				break
-			}
-		}
+		//if len(r.RaftLog.entries) != 0 {
+		//	for i := 0; i < len(r.RaftLog.entries); i++ {
+		//		if r.RaftLog.entries[i].Term == m.Term {
+		//			appendResp.Entries = []*pb.Entry{
+		//				&(r.RaftLog.entries[i]),
+		//			}
+		//		}
+		//		break
+		//	}
+		//}
 		return
 	}
 	// append the entry in my log
@@ -649,7 +659,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		}
 	}
 	if len(m.Entries) != 0 {
-		// log.Infof("Raft %d receive log from peer %d range [%d,%d]", r.id, m.From, m.Entries[0].Index, m.Entries[len(m.Entries)-1].Index)
+		//log.Infof("Raft %d receive log from peer %d range [%d,%d]", r.id, m.From, m.Entries[0].Index, m.Entries[len(m.Entries)-1].Index)
 	}
 	for _, entp := range m.Entries {
 		lastNewEntryIndex = entp.Index
@@ -687,22 +697,23 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	}
 	// If m.From reject append RPC because of don't match the prevLog, decrease the r.Prs[to].Next
 	if m.Reject && m.Index == r.Prs[m.From].Next-1 {
-		// Find the first index of return term
-		if len(m.Entries) != 0 {
-			ent := m.Entries[0]
-			for i := 0; i < len(r.RaftLog.entries); i++ {
-				if ent.Term == r.RaftLog.entries[i].Term {
-					if r.Prs[m.From].Next != r.RaftLog.entries[i].Index {
-						r.Prs[m.From].Next = r.RaftLog.entries[i].Index
-					}else {
-						r.Prs[m.From].Next--
-					}
-					break
-				}
-			}
-		} else {
-			r.Prs[m.From].Next -= 1
-		}
+		// Find the first index of return term2
+		r.Prs[m.From].Next -= 1
+		//if len(m.Entries) != 0 {
+		//	ent := m.Entries[0]
+		//	for i := 0; i < len(r.RaftLog.entries); i++ {
+		//		if ent.Term == r.RaftLog.entries[i].Term {
+		//			if r.Prs[m.From].Next != r.RaftLog.entries[i].Index {
+		//				r.Prs[m.From].Next = r.RaftLog.entries[i].Index
+		//			}else {
+		//				r.Prs[m.From].Next--
+		//			}
+		//			break
+		//		}
+		//	}
+		//} else {
+		//	r.Prs[m.From].Next -= 1
+		//}
 		// if reject, need send again with new next
 		r.sendAppend(m.From)
 		return
@@ -777,12 +788,14 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		if lt < m.LogTerm {
 			// Vote
 			r.Vote = m.From
+			r.resetElectionElapsed()
 			resp.Reject = false
 		} else if lt == m.LogTerm {
 			if r.RaftLog.LastIndex() <= m.Index {
 				// Vote
 				r.Vote = m.From
 				resp.Reject = false
+				r.resetElectionElapsed()
 			}
 		}
 	}
@@ -825,6 +838,9 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	if r.nRejectVotes() >= (r.nPeers()/2 + 1) {
 		// transfer to follower
 		r.becomeFollower(r.Term, None)
+		if r.pendingElectionElapsed != -2{
+			r.pendingElectionElapsed= -2
+		}
 	}
 }
 
