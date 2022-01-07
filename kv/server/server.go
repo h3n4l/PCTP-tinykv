@@ -90,8 +90,6 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 	resp := &kvrpcpb.PrewriteResponse{}
 	reader, _ := server.storage.Reader(req.Context)
 	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
-	i := len(req.Mutations)
-	log.Println("mutation len : ", i)
 	for _, m := range req.Mutations {
 		write, cTs, _ := txn.MostRecentWrite(m.Key)
 		if write != nil {
@@ -179,7 +177,62 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := &kvrpcpb.ScanResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+	txn := mvcc.NewMvccTxn(reader, req.Version)
+	scanner := mvcc.NewScanner(req.StartKey, txn)
+	defer scanner.Close()
+	var pairs []*kvrpcpb.KvPair
+	limit := int(req.Limit)
+	for i := 0; i < limit; {
+		key, value, err := scanner.Next()
+		if err != nil {
+			if regionErr, ok := err.(*raft_storage.RegionError); ok {
+				resp.RegionError = regionErr.RequestErr
+				return resp, nil
+			}
+			return nil, err
+		}
+		if key == nil {
+			break
+		}
+		lock, err := txn.GetLock(key)
+		if err != nil {
+			if regionErr, ok := err.(*raft_storage.RegionError); ok {
+				resp.RegionError = regionErr.RequestErr
+				return resp, nil
+			}
+			return nil, err
+		}
+		if lock != nil && req.Version >= lock.Ts {
+			pairs = append(pairs, &kvrpcpb.KvPair{
+				Error: &kvrpcpb.KeyError{
+					Locked: &kvrpcpb.LockInfo{
+						PrimaryLock: lock.Primary,
+						LockVersion: lock.Ts,
+						Key:         key,
+						LockTtl:     lock.Ttl,
+					}},
+				Key: key,
+			})
+			i++
+			continue
+		}
+		if value != nil {
+			pairs = append(pairs, &kvrpcpb.KvPair{Key: key, Value: value})
+			i++
+		}
+	}
+	resp.Pairs = pairs
+	return resp, nil
 }
 
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
@@ -241,11 +294,10 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
 	server.Latches.WaitForLatches(req.Keys)
 	defer server.Latches.ReleaseLatches(req.Keys)
-	log.Println("Keys: ", req.Keys)
 	for _, k := range req.Keys {
 		write, _, _ := txn.CurrentWrite(k)
 		if write != nil && write.Kind != mvcc.WriteKindRollback {
-			resp.Error = &kvrpcpb.KeyError{Abort: "txn aborted"}
+			resp.Error = &kvrpcpb.KeyError{Abort: "abort"}
 			return resp, nil
 		}
 		if write != nil && write.Kind == mvcc.WriteKindRollback {
@@ -271,7 +323,12 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 		txn.DeleteValue(k)
 	}
 	err := server.storage.Write(req.Context, txn.Writes())
-	log.Println(err)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+	}
 	return resp, nil
 }
 
